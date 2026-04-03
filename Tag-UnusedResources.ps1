@@ -31,6 +31,9 @@
 
 .PARAMETER ExcludeTagName
     Resources with this tag will be excluded. Default: "decommission-exclude"
+
+.NOTES
+    Requires: Az.Accounts, Az.ResourceGraph, Az.Resources
 #>
 
 param(
@@ -134,21 +137,24 @@ Write-Log "IdleWindowDays: $IdleWindowDays"
 Write-Log "StaleWindowDays: $StaleWindowDays"
 Write-Log "ExcludeTagName: $ExcludeTagName"
 
-# Authenticate - check if already connected first
-$context = Get-AzContext -ErrorAction SilentlyContinue
-if ($context) {
-    Write-Log "Already authenticated as: $($context.Account.Id)"
+# Authenticate - Always authenticate in Azure Automation (each job starts fresh)
+# Try Managed Identity first (works in Azure Automation)
+# Fall back to existing context (works locally if already logged in)
+try {
+    Write-Log "Attempting Managed Identity authentication..."
+    $connection = Connect-AzAccount -Identity -ErrorAction Stop
+    Write-Log "Authenticated using Managed Identity: $($connection.Context.Account.Id)"
 }
-else {
-    # Try Managed Identity first (for Azure Automation)
-    try {
-        $connection = Connect-AzAccount -Identity -ErrorAction Stop
-        Write-Log "Authenticated using Managed Identity"
+catch {
+    Write-Log "Managed Identity not available, checking for existing context..." -Level "WARN"
+    $context = Get-AzContext -ErrorAction SilentlyContinue
+    if ($context) {
+        Write-Log "Using existing context: $($context.Account.Id)"
     }
-    catch {
-        Write-Log "Managed Identity not available (expected when running locally)" -Level "WARN"
-        Write-Log "Please ensure you are logged in via 'Connect-AzAccount' or 'az login'" -Level "WARN"
-        throw "No Azure authentication context found. Run 'Connect-AzAccount' first."
+    else {
+        Write-Log "No authentication context found." -Level "ERROR"
+        Write-Log "For local testing, run 'Connect-AzAccount' first." -Level "ERROR"
+        throw "Authentication failed. No Managed Identity or existing Azure context."
     }
 }
 
