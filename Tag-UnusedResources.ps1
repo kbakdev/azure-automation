@@ -232,6 +232,94 @@ function Get-SubscriptionName {
     return $SubscriptionId
 }
 
+# Helper to estimate monthly cost (EUR)
+function Get-EstimatedMonthlyCost {
+    param(
+        [string]$ResourceType,
+        [object]$Resource
+    )
+    
+    switch ($ResourceType) {
+        "Disk" {
+            $sizeGB = [int]$Resource.diskSizeGB
+            $sku = $Resource.sku_name
+            
+            if ($sku -match "Premium") {
+                if ($sizeGB -le 32) { return 5.28 }
+                elseif ($sizeGB -le 64) { return 10.21 }
+                elseif ($sizeGB -le 128) { return 19.71 }
+                elseif ($sizeGB -le 256) { return 38.02 }
+                elseif ($sizeGB -le 512) { return 73.22 }
+                elseif ($sizeGB -le 1024) { return 140.74 }
+                elseif ($sizeGB -le 2048) { return 270.34 }
+                else { return 519.48 }
+            }
+            elseif ($sku -match "StandardSSD") {
+                if ($sizeGB -le 32) { return 2.40 }
+                elseif ($sizeGB -le 64) { return 4.80 }
+                elseif ($sizeGB -le 128) { return 9.60 }
+                elseif ($sizeGB -le 256) { return 18.43 }
+                elseif ($sizeGB -le 512) { return 35.33 }
+                elseif ($sizeGB -le 1024) { return 67.58 }
+                else { return 129.54 }
+            }
+            else {
+                # Standard HDD
+                return $sizeGB * 0.04
+            }
+        }
+        "PublicIP" {
+            $sku = $Resource.sku_name
+            if ($sku -eq "Standard") { return 3.65 }
+            else { return 2.63 }
+        }
+        "VM" {
+            $vmSize = $Resource.vmSize
+            if ($vmSize -match "Standard_B1") { return 8.0 }
+            elseif ($vmSize -match "Standard_B2") { return 30.0 }
+            elseif ($vmSize -match "Standard_D2") { return 70.0 }
+            elseif ($vmSize -match "Standard_D4") { return 140.0 }
+            elseif ($vmSize -match "Standard_D8") { return 280.0 }
+            elseif ($vmSize -match "Standard_E2") { return 100.0 }
+            elseif ($vmSize -match "Standard_E4") { return 200.0 }
+            else { return 50.0 }
+        }
+        "AppServicePlan" {
+            $sku = $Resource.sku_name
+            switch ($sku) {
+                "F1" { return 0.0 }
+                "B1" { return 12.41 }
+                "B2" { return 24.82 }
+                "B3" { return 49.64 }
+                "S1" { return 66.43 }
+                "S2" { return 132.86 }
+                "S3" { return 265.72 }
+                "P1v2" { return 73.73 }
+                "P2v2" { return 147.46 }
+                "P3v2" { return 294.92 }
+                "P1v3" { return 89.79 }
+                "P2v3" { return 179.58 }
+                "P3v3" { return 359.16 }
+                default { return 30.0 }
+            }
+        }
+        "Snapshot" {
+            $sizeGB = [int]$Resource.diskSizeGB
+            return $sizeGB * 0.05
+        }
+        default { return 0.0 }
+    }
+}
+
+# Track cost estimates
+$costEstimates = @{
+    "UnattachedDisks" = 0.0
+    "OrphanPIPs" = 0.0
+    "DeallocatedVMs" = 0.0
+    "EmptyASPs" = 0.0
+    "StaleSnapshots" = 0.0
+}
+
 # Helper to log resource details
 function Write-ResourceTable {
     param(
@@ -309,6 +397,7 @@ Write-ResourceTable -Category "UnattachedDisks" -Resources $disks -ExtraFields @
 foreach ($disk in $disks) {
     $result = Add-DecommissionTag -ResourceId $disk.id -Reason "Orphan-UnattachedDisk" -DryRun $DryRun
     if ($result) { $summary["UnattachedDisks"].Tagged++ }
+    $costEstimates["UnattachedDisks"] += Get-EstimatedMonthlyCost -ResourceType "Disk" -Resource $disk
 }
 Write-Log ""
 
@@ -363,6 +452,7 @@ Write-ResourceTable -Category "OrphanPIPs" -Resources $pips -ExtraFields @{ "SKU
 foreach ($pip in $pips) {
     $result = Add-DecommissionTag -ResourceId $pip.id -Reason "Orphan-NotAssociated" -DryRun $DryRun
     if ($result) { $summary["OrphanPIPs"].Tagged++ }
+    $costEstimates["OrphanPIPs"] += Get-EstimatedMonthlyCost -ResourceType "PublicIP" -Resource $pip
 }
 Write-Log ""
 
@@ -422,6 +512,7 @@ Write-ResourceTable -Category "DeallocatedVMs" -Resources $vms -ExtraFields @{ "
 foreach ($vm in $vms) {
     $result = Add-DecommissionTag -ResourceId $vm.id -Reason "Idle-Deallocated" -DryRun $DryRun
     if ($result) { $summary["DeallocatedVMs"].Tagged++ }
+    $costEstimates["DeallocatedVMs"] += Get-EstimatedMonthlyCost -ResourceType "VM" -Resource $vm
 }
 Write-Log ""
 
@@ -448,6 +539,7 @@ Write-ResourceTable -Category "EmptyASPs" -Resources $asps -ExtraFields @{ "SKU"
 foreach ($asp in $asps) {
     $result = Add-DecommissionTag -ResourceId $asp.id -Reason "Idle-NoAppsHosted" -DryRun $DryRun
     if ($result) { $summary["EmptyASPs"].Tagged++ }
+    $costEstimates["EmptyASPs"] += Get-EstimatedMonthlyCost -ResourceType "AppServicePlan" -Resource $asp
 }
 Write-Log ""
 
@@ -480,6 +572,7 @@ Write-ResourceTable -Category "StaleSnapshots" -Resources $snapshots -ExtraField
 foreach ($snapshot in $snapshots) {
     $result = Add-DecommissionTag -ResourceId $snapshot.id -Reason "Stale-OlderThan${StaleWindowDays}Days" -DryRun $DryRun
     if ($result) { $summary["StaleSnapshots"].Tagged++ }
+    $costEstimates["StaleSnapshots"] += Get-EstimatedMonthlyCost -ResourceType "Snapshot" -Resource $snapshot
 }
 Write-Log ""
 
@@ -524,30 +617,41 @@ Write-Log "                      SUMMARY REPORT"
 Write-Log "============================================================"
 Write-Log ""
 Write-Log "SCAN RESULTS:"
-Write-Log "    ┌────────────────────────────┬─────────┬─────────┐"
-Write-Log "    │ Category                   │  Found  │  Tagged │"
-Write-Log "    ├────────────────────────────┼─────────┼─────────┤"
+Write-Log "    ┌────────────────────────────┬─────────┬─────────┬────────────────┐"
+Write-Log "    │ Category                   │  Found  │  Tagged │ Est. Cost/mo   │"
+Write-Log "    ├────────────────────────────┼─────────┼─────────┼────────────────┤"
 
 $totalFound = 0
 $totalTagged = 0
+$totalCost = 0.0
 
 $categoryOrder = @("UnattachedDisks", "OrphanNICs", "OrphanPIPs", "OrphanNSGs", "DeallocatedVMs", "EmptyASPs", "StaleSnapshots", "StaleImages")
 foreach ($category in $categoryOrder) {
     $found = $summary[$category].Found
     $tagged = $summary[$category].Tagged
+    $cost = if ($costEstimates.ContainsKey($category)) { $costEstimates[$category] } else { 0.0 }
     $totalFound += $found
     $totalTagged += $tagged
+    $totalCost += $cost
     $categoryName = $category.PadRight(26)
     $foundStr = $found.ToString().PadLeft(5)
     $taggedStr = $tagged.ToString().PadLeft(5)
-    Write-Log "    │ $categoryName │ $foundStr   │ $taggedStr   │"
+    $costStr = ("€" + [math]::Round($cost, 2).ToString("N2")).PadLeft(12)
+    Write-Log "    │ $categoryName │ $foundStr   │ $taggedStr   │ $costStr   │"
 }
 
-Write-Log "    ├────────────────────────────┼─────────┼─────────┤"
+Write-Log "    ├────────────────────────────┼─────────┼─────────┼────────────────┤"
 $totalFoundStr = $totalFound.ToString().PadLeft(5)
 $totalTaggedStr = $totalTagged.ToString().PadLeft(5)
-Write-Log "    │ TOTAL                      │ $totalFoundStr   │ $totalTaggedStr   │"
-Write-Log "    └────────────────────────────┴─────────┴─────────┘"
+$totalCostStr = ("€" + [math]::Round($totalCost, 2).ToString("N2")).PadLeft(12)
+Write-Log "    │ TOTAL                      │ $totalFoundStr   │ $totalTaggedStr   │ $totalCostStr   │"
+Write-Log "    └────────────────────────────┴─────────┴─────────┴────────────────┘"
+Write-Log ""
+
+Write-Log "POTENTIAL SAVINGS:"
+Write-Log "    Estimated Monthly Savings: €$([math]::Round($totalCost, 2).ToString("N2")) EUR"
+Write-Log "    Estimated Annual Savings:  €$([math]::Round($totalCost * 12, 2).ToString("N2")) EUR"
+Write-Log "    (Based on West Europe pricing estimates)"
 Write-Log ""
 
 Write-Log "EXECUTION DETAILS:"
@@ -560,11 +664,13 @@ Write-Log ""
 if ($DryRun) {
     Write-Log "============================================================"
     Write-Log "    DRY RUN COMPLETE - NO CHANGES WERE MADE"
+    Write-Log "    Potential Monthly Savings: €$([math]::Round($totalCost, 2).ToString("N2"))"
     Write-Log "    Run with -DryRun `$false to apply tags"
     Write-Log "============================================================"
 } else {
     Write-Log "============================================================"
     Write-Log "    TAGGING COMPLETE - $totalTagged resources tagged"
+    Write-Log "    Potential Monthly Savings: €$([math]::Round($totalCost, 2).ToString("N2"))"
     Write-Log "============================================================"
 }
 
