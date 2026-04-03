@@ -17,8 +17,12 @@
     If $true, only reports what would be tagged without making changes.
     Default: $true (safe by default)
 
+.PARAMETER ManagementGroupId
+    Management Group ID to scan all subscriptions under it (uuidv4).
+
 .PARAMETER Subscriptions
-    Array of subscription IDs to scan. If empty, scans all accessible subscriptions.
+    Array of subscription IDs to scan. If empty and ManagementGroupId not set,
+    scans all accessible subscriptions.
 
 .PARAMETER IdleWindowDays
     Number of days a VM must be deallocated to be considered idle. Default: 30
@@ -33,12 +37,16 @@
     Resources with this tag will be excluded. Default: "decommission-exclude"
 
 .NOTES
+    Version: 1.0.0
     Requires: Az.Accounts, Az.ResourceGraph, Az.Resources
 #>
 
 param(
     [Parameter(Mandatory = $false)]
     [bool]$DryRun = $true,
+
+    [Parameter(Mandatory = $false)]
+    [string]$ManagementGroupId = "",
 
     [Parameter(Mandatory = $false)]
     [string[]]$Subscriptions = @(),
@@ -67,16 +75,24 @@ function Write-Log {
 function Get-ResourceGraphResults {
     param(
         [string]$Query,
+        [string]$ManagementGroupId,
         [string[]]$Subscriptions
     )
     
     $results = @()
     
-    if ($Subscriptions.Count -eq 0) {
-        # Query all accessible subscriptions
-        $results = Search-AzGraph -Query $Query -First 1000
-    } else {
+    if ($ManagementGroupId -ne "") {
+        # Query at Management Group scope (all subscriptions under it)
+        Write-Log "Querying Management Group: $ManagementGroupId" -Level "DEBUG"
+        $results = Search-AzGraph -Query $Query -ManagementGroup $ManagementGroupId -First 1000
+    }
+    elseif ($Subscriptions.Count -gt 0) {
+        # Query specific subscriptions
         $results = Search-AzGraph -Query $Query -Subscription $Subscriptions -First 1000
+    }
+    else {
+        # Query all accessible subscriptions (default)
+        $results = Search-AzGraph -Query $Query -First 1000
     }
     
     return $results
@@ -133,30 +149,11 @@ Write-Log "=========================================="
 Write-Log "Unused Resource Tagging Automation"
 Write-Log "=========================================="
 Write-Log "DryRun: $DryRun"
+Write-Log "ManagementGroupId: $(if ($ManagementGroupId) { $ManagementGroupId } else { '(not set - using subscriptions)' })"
+Write-Log "Subscriptions: $(if ($Subscriptions.Count -gt 0) { $Subscriptions -join ', ' } else { '(all accessible)' })"
 Write-Log "IdleWindowDays: $IdleWindowDays"
 Write-Log "StaleWindowDays: $StaleWindowDays"
 Write-Log "ExcludeTagName: $ExcludeTagName"
-
-# # Authenticate - Always authenticate in Azure Automation (each job starts fresh)
-# # Try Managed Identity first (works in Azure Automation)
-# # Fall back to existing context (works locally if already logged in)
-# try {
-#     Write-Log "Attempting Managed Identity authentication..."
-#     $connection = Connect-AzAccount -Identity -ErrorAction Stop
-#     Write-Log "Authenticated using Managed Identity: $($connection.Context.Account.Id)"
-# }
-# catch {
-#     Write-Log "Managed Identity not available, checking for existing context..." -Level "WARN"
-#     $context = Get-AzContext -ErrorAction SilentlyContinue
-#     if ($context) {
-#         Write-Log "Using existing context: $($context.Account.Id)"
-#     }
-#     else {
-#         Write-Log "No authentication context found." -Level "ERROR"
-#         Write-Log "For local testing, run 'Connect-AzAccount' first." -Level "ERROR"
-#         throw "Authentication failed. No Managed Identity or existing Azure context."
-#     }
-# }
 
 # Build exclusion filter
 $excludeRgFilter = ""
@@ -195,7 +192,7 @@ $alreadyTaggedFilter
 | project id, name, resourceGroup, location, subscriptionId, sku.name, properties.diskSizeGB
 "@
 
-$disks = Get-ResourceGraphResults -Query $query -Subscriptions $Subscriptions
+$disks = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
 $summary["UnattachedDisks"].Found = $disks.Count
 Write-Log "Found $($disks.Count) unattached disks"
 
@@ -217,7 +214,7 @@ $alreadyTaggedFilter
 | project id, name, resourceGroup, location, subscriptionId
 "@
 
-$nics = Get-ResourceGraphResults -Query $query -Subscriptions $Subscriptions
+$nics = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
 $summary["OrphanNICs"].Found = $nics.Count
 Write-Log "Found $($nics.Count) orphan NICs"
 
@@ -239,7 +236,7 @@ $alreadyTaggedFilter
 | project id, name, resourceGroup, location, subscriptionId, sku.name
 "@
 
-$pips = Get-ResourceGraphResults -Query $query -Subscriptions $Subscriptions
+$pips = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
 $summary["OrphanPIPs"].Found = $pips.Count
 Write-Log "Found $($pips.Count) orphan Public IPs"
 
@@ -261,7 +258,7 @@ $alreadyTaggedFilter
 | project id, name, resourceGroup, location, subscriptionId
 "@
 
-$nsgs = Get-ResourceGraphResults -Query $query -Subscriptions $Subscriptions
+$nsgs = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
 $summary["OrphanNSGs"].Found = $nsgs.Count
 Write-Log "Found $($nsgs.Count) orphan NSGs"
 
@@ -288,7 +285,7 @@ $alreadyTaggedFilter
 | project id, name, resourceGroup, location, subscriptionId, properties.hardwareProfile.vmSize
 "@
 
-$vms = Get-ResourceGraphResults -Query $query -Subscriptions $Subscriptions
+$vms = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
 $summary["DeallocatedVMs"].Found = $vms.Count
 Write-Log "Found $($vms.Count) deallocated VMs"
 
@@ -309,7 +306,7 @@ $alreadyTaggedFilter
 | project id, name, resourceGroup, location, subscriptionId, sku.name
 "@
 
-$asps = Get-ResourceGraphResults -Query $query -Subscriptions $Subscriptions
+$asps = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
 $summary["EmptyASPs"].Found = $asps.Count
 Write-Log "Found $($asps.Count) empty App Service Plans"
 
@@ -336,7 +333,7 @@ $alreadyTaggedFilter
 | project id, name, resourceGroup, location, subscriptionId, properties.diskSizeGB, properties.timeCreated
 "@
 
-$snapshots = Get-ResourceGraphResults -Query $query -Subscriptions $Subscriptions
+$snapshots = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
 $summary["StaleSnapshots"].Found = $snapshots.Count
 Write-Log "Found $($snapshots.Count) stale snapshots"
 
@@ -359,7 +356,7 @@ $alreadyTaggedFilter
 
 # Note: images don't have timeCreated in ARG, would need activity logs for precise dating
 # For now, we tag all images for manual review
-$images = Get-ResourceGraphResults -Query $query -Subscriptions $Subscriptions
+$images = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
 $summary["StaleImages"].Found = $images.Count
 Write-Log "Found $($images.Count) VM images (require manual age verification)"
 
