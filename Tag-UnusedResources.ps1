@@ -137,26 +137,26 @@ Write-Log "IdleWindowDays: $IdleWindowDays"
 Write-Log "StaleWindowDays: $StaleWindowDays"
 Write-Log "ExcludeTagName: $ExcludeTagName"
 
-# Authenticate - Always authenticate in Azure Automation (each job starts fresh)
-# Try Managed Identity first (works in Azure Automation)
-# Fall back to existing context (works locally if already logged in)
-try {
-    Write-Log "Attempting Managed Identity authentication..."
-    $connection = Connect-AzAccount -Identity -ErrorAction Stop
-    Write-Log "Authenticated using Managed Identity: $($connection.Context.Account.Id)"
-}
-catch {
-    Write-Log "Managed Identity not available, checking for existing context..." -Level "WARN"
-    $context = Get-AzContext -ErrorAction SilentlyContinue
-    if ($context) {
-        Write-Log "Using existing context: $($context.Account.Id)"
-    }
-    else {
-        Write-Log "No authentication context found." -Level "ERROR"
-        Write-Log "For local testing, run 'Connect-AzAccount' first." -Level "ERROR"
-        throw "Authentication failed. No Managed Identity or existing Azure context."
-    }
-}
+# # Authenticate - Always authenticate in Azure Automation (each job starts fresh)
+# # Try Managed Identity first (works in Azure Automation)
+# # Fall back to existing context (works locally if already logged in)
+# try {
+#     Write-Log "Attempting Managed Identity authentication..."
+#     $connection = Connect-AzAccount -Identity -ErrorAction Stop
+#     Write-Log "Authenticated using Managed Identity: $($connection.Context.Account.Id)"
+# }
+# catch {
+#     Write-Log "Managed Identity not available, checking for existing context..." -Level "WARN"
+#     $context = Get-AzContext -ErrorAction SilentlyContinue
+#     if ($context) {
+#         Write-Log "Using existing context: $($context.Account.Id)"
+#     }
+#     else {
+#         Write-Log "No authentication context found." -Level "ERROR"
+#         Write-Log "For local testing, run 'Connect-AzAccount' first." -Level "ERROR"
+#         throw "Authentication failed. No Managed Identity or existing Azure context."
+#     }
+# }
 
 # Build exclusion filter
 $excludeRgFilter = ""
