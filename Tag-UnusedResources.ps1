@@ -134,14 +134,22 @@ Write-Log "IdleWindowDays: $IdleWindowDays"
 Write-Log "StaleWindowDays: $StaleWindowDays"
 Write-Log "ExcludeTagName: $ExcludeTagName"
 
-# Authenticate using Managed Identity (for Azure Automation)
-try {
-    $connection = Connect-AzAccount -Identity -ErrorAction Stop
-    Write-Log "Authenticated using Managed Identity"
+# Authenticate - check if already connected first
+$context = Get-AzContext -ErrorAction SilentlyContinue
+if ($context) {
+    Write-Log "Already authenticated as: $($context.Account.Id)"
 }
-catch {
-    Write-Log "Managed Identity authentication failed, attempting interactive..." -Level "WARN"
-    $connection = Connect-AzAccount -ErrorAction Stop
+else {
+    # Try Managed Identity first (for Azure Automation)
+    try {
+        $connection = Connect-AzAccount -Identity -ErrorAction Stop
+        Write-Log "Authenticated using Managed Identity"
+    }
+    catch {
+        Write-Log "Managed Identity not available (expected when running locally)" -Level "WARN"
+        Write-Log "Please ensure you are logged in via 'Connect-AzAccount' or 'az login'" -Level "WARN"
+        throw "No Azure authentication context found. Run 'Connect-AzAccount' first."
+    }
 }
 
 # Build exclusion filter
