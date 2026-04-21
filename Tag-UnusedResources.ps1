@@ -81,8 +81,14 @@
     If empty, defaults to $env:TEMP\decommission-candidates-<timestamp>.json
 
 .NOTES
-    Version: 1.1.1
+    Version: 1.1.2
     Requires: Az.Accounts, Az.ResourceGraph, Az.Resources, Az.Monitor (for IdleWindowDays > 0)
+
+    Changelog (v1.1.1 -> v1.1.2):
+      - FIX: Correctly unwrap Search-AzGraph responses so only row records are processed (prevents array-shaped resource fields).
+      - FIX: Harden owner resolution against null/array subscription IDs before cache lookups.
+      - FIX: Make disk size conversion resilient to non-scalar values in cost estimation.
+      - FIX: Repair review-expiry query by casting lifecycle-reviewed to datetime before comparison.
 
     Changelog (v1.1.0 -> v1.1.1):
       - FIX: Search-AzGraph calls now paginate via SkipToken (previously capped silently at 1000 rows).
@@ -176,8 +182,21 @@ function Invoke-ArgPaged {
 
         $response = Search-AzGraph @params
         if ($response) {
-            foreach ($row in $response) { $all.Add($row) | Out-Null }
-            $skipToken = $response.SkipToken
+            $rows = @()
+            if ($response.PSObject.Properties.Name -contains 'Data') {
+                # Some Az.ResourceGraph versions return a wrapper object with Data + SkipToken
+                $rows = @($response.Data)
+                $skipToken = $response.SkipToken
+            }
+            else {
+                # Other versions return row objects directly (array may carry SkipToken note property)
+                $rows = @($response)
+                $skipToken = $response.SkipToken
+            }
+
+            foreach ($row in $rows) {
+                if ($null -ne $row) { $all.Add($row) | Out-Null }
+            }
         } else {
             $skipToken = $null
         }
@@ -203,6 +222,38 @@ function Get-ResourceGraphResults {
         Write-Log "Querying Management Group: $ManagementGroupId" -Level "DEBUG"
     }
     return Invoke-ArgPaged -Query $Query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
+}
+
+function Get-FirstNonEmptyString {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return $null }
+
+    if ($Value -is [System.Array]) {
+        foreach ($candidate in $Value) {
+            $s = [string]$candidate
+            if (-not [string]::IsNullOrWhiteSpace($s)) { return $s }
+        }
+        return $null
+    }
+
+    $single = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($single)) { return $null }
+    return $single
+}
+
+function Convert-ToIntSafe {
+    param(
+        [object]$Value,
+        [int]$Default = 0
+    )
+
+    $scalar = Get-FirstNonEmptyString -Value $Value
+    if ($null -eq $scalar) { return $Default }
+
+    $parsed = 0
+    if ([int]::TryParse($scalar, [ref]$parsed)) { return $parsed }
+    return $Default
 }
 
 # --- Owner derivation -------------------------------------------------------
@@ -261,13 +312,18 @@ function Resolve-LifecycleOwner {
         }
     }
 
+    $subscriptionId = Get-FirstNonEmptyString -Value $Resource.subscriptionId
+    $resourceGroup  = Get-FirstNonEmptyString -Value $Resource.resourceGroup
+
     # 2. Resource Group tag
-    $rgOwner = Get-RgOwner -SubscriptionId $Resource.subscriptionId -ResourceGroup $Resource.resourceGroup -OwnerTagSource $OwnerTagSource
-    if ($rgOwner) { return $rgOwner }
+    if ($subscriptionId -and $resourceGroup) {
+        $rgOwner = Get-RgOwner -SubscriptionId $subscriptionId -ResourceGroup $resourceGroup -OwnerTagSource $OwnerTagSource
+        if ($rgOwner) { return $rgOwner }
+    }
 
     # 3. Subscription tag
-    if ($script:SubOwnerCache.ContainsKey($Resource.subscriptionId)) {
-        $subOwner = $script:SubOwnerCache[$Resource.subscriptionId]
+    if ($subscriptionId -and $script:SubOwnerCache.ContainsKey($subscriptionId)) {
+        $subOwner = $script:SubOwnerCache[$subscriptionId]
         if ($subOwner) { return $subOwner }
     }
 
@@ -512,7 +568,7 @@ function Get-EstimatedMonthlyCost {
 
     switch ($ResourceType) {
         "Disk" {
-            $sizeGB = [int]$Resource.diskSizeGB
+            $sizeGB = Convert-ToIntSafe -Value $Resource.diskSizeGB -Default 0
             $sku = $Resource.sku_name
 
             if ($sku -match "Premium") {
@@ -574,7 +630,7 @@ function Get-EstimatedMonthlyCost {
             }
         }
         "Snapshot" {
-            $sizeGB = [int]$Resource.diskSizeGB
+            $sizeGB = Convert-ToIntSafe -Value $Resource.diskSizeGB -Default 0
             return $sizeGB * 0.05
         }
         default { return 0.0 }
@@ -584,6 +640,11 @@ function Get-EstimatedMonthlyCost {
 function Write-ResourceTable {
     param([string]$Category, [object[]]$Resources, [hashtable]$ExtraFields)
 
+    $Resources = @($Resources | Where-Object { $null -ne $_ })
+    if ($Resources.Count -eq 1 -and $Resources[0] -is [System.Array]) {
+        $Resources = @($Resources[0] | Where-Object { $null -ne $_ })
+    }
+
     if ($Resources.Count -eq 0) {
         Write-Log "    (no resources found)"
         return
@@ -592,12 +653,18 @@ function Write-ResourceTable {
     Write-Log "    +-----------------------------------------------------------------------------"
     $counter = 1
     foreach ($res in $Resources) {
-        $subName = Get-SubscriptionName -SubscriptionId $res.subscriptionId
-        Write-Log "    | [$counter] $($res.name)"
+        $resourceName = Get-FirstNonEmptyString -Value $res.name
+        $subscriptionId = Get-FirstNonEmptyString -Value $res.subscriptionId
+        $resourceGroup = Get-FirstNonEmptyString -Value $res.resourceGroup
+        $location = Get-FirstNonEmptyString -Value $res.location
+        $resourceId = Get-FirstNonEmptyString -Value $res.id
+
+        $subName = Get-SubscriptionName -SubscriptionId $subscriptionId
+        Write-Log "    | [$counter] $resourceName"
         Write-Log "    |     Subscription:   $subName"
-        Write-Log "    |     Resource Group: $($res.resourceGroup)"
-        Write-Log "    |     Location:       $($res.location)"
-        Write-Log "    |     Resource ID:    $($res.id)"
+        Write-Log "    |     Resource Group: $resourceGroup"
+        Write-Log "    |     Location:       $location"
+        Write-Log "    |     Resource ID:    $resourceId"
 
         if ($ExtraFields) {
             foreach ($label in $ExtraFields.Keys) {
@@ -900,7 +967,8 @@ if ($TagMode -in @("typed", "dual")) {
     $query = @"
 resources
 | where tags['lifecycle-state'] == 'exempt'
-| where isnull(tags['lifecycle-reviewed']) or tostring(tags['lifecycle-reviewed']) < '$expiryDate'
+| extend lifecycleReviewed = todatetime(tostring(tags['lifecycle-reviewed']))
+| where isnull(lifecycleReviewed) or lifecycleReviewed < datetime('$expiryDate')
 $excludeRgFilter
 | project id, name, resourceGroup, location, subscriptionId, tags
 "@
