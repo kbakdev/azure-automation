@@ -81,8 +81,13 @@
     If empty, defaults to $env:TEMP\decommission-candidates-<timestamp>.json
 
 .NOTES
-    Version: 1.1.0
+    Version: 1.1.1
     Requires: Az.Accounts, Az.ResourceGraph, Az.Resources, Az.Monitor (for IdleWindowDays > 0)
+
+    Changelog (v1.1.0 -> v1.1.1):
+      - FIX: Search-AzGraph calls now paginate via SkipToken (previously capped silently at 1000 rows).
+              Affected both resource-class scans and subscription discovery. At MG scale this caused
+              missed candidates AND silent owner-resolution failures for resources in overflow subs.
 
     Changelog (v1.0.0 -> v1.1.0):
       - Added typed lifecycle-* tag family with dual-write migration mode
@@ -142,6 +147,51 @@ function Write-Log {
     Write-Output "[$timestamp] [$Level] $Message"
 }
 
+function Invoke-ArgPaged {
+    # Shared pagination helper. Search-AzGraph returns up to 1000 rows per call
+    # and a SkipToken when more remain. We loop until SkipToken is empty.
+    param(
+        [string]$Query,
+        [string]$ManagementGroupId,
+        [string[]]$Subscriptions,
+        [int]$PageSize = 1000,
+        [int]$MaxPages = 100   # hard cap against runaway queries; 100k rows
+    )
+
+    $all = New-Object System.Collections.Generic.List[object]
+    $skipToken = $null
+    $page = 0
+
+    do {
+        $params = @{
+            Query = $Query
+            First = $PageSize
+        }
+        if ($ManagementGroupId -ne "") {
+            $params.ManagementGroup = $ManagementGroupId
+        } elseif ($Subscriptions -and $Subscriptions.Count -gt 0) {
+            $params.Subscription = $Subscriptions
+        }
+        if ($skipToken) { $params.SkipToken = $skipToken }
+
+        $response = Search-AzGraph @params
+        if ($response) {
+            foreach ($row in $response) { $all.Add($row) | Out-Null }
+            $skipToken = $response.SkipToken
+        } else {
+            $skipToken = $null
+        }
+
+        $page++
+        if ($page -ge $MaxPages) {
+            Write-Log "Invoke-ArgPaged hit MaxPages ($MaxPages); results may be incomplete." -Level "WARN"
+            break
+        }
+    } while ($skipToken)
+
+    return ,$all.ToArray()
+}
+
 function Get-ResourceGraphResults {
     param(
         [string]$Query,
@@ -149,20 +199,10 @@ function Get-ResourceGraphResults {
         [string[]]$Subscriptions
     )
 
-    $results = @()
-
     if ($ManagementGroupId -ne "") {
         Write-Log "Querying Management Group: $ManagementGroupId" -Level "DEBUG"
-        $results = Search-AzGraph -Query $Query -ManagementGroup $ManagementGroupId -First 1000
     }
-    elseif ($Subscriptions.Count -gt 0) {
-        $results = Search-AzGraph -Query $Query -Subscription $Subscriptions -First 1000
-    }
-    else {
-        $results = Search-AzGraph -Query $Query -First 1000
-    }
-
-    return $results
+    return Invoke-ArgPaged -Query $Query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
 }
 
 # --- Owner derivation -------------------------------------------------------
@@ -398,13 +438,7 @@ Write-Log ""
 Write-Log "DISCOVERING SUBSCRIPTIONS IN SCOPE..."
 $subscriptionQuery = "resourcecontainers | where type == 'microsoft.resources/subscriptions' | project subscriptionId, name, tags"
 try {
-    if ($ManagementGroupId) {
-        $subsInScope = Search-AzGraph -Query $subscriptionQuery -ManagementGroup $ManagementGroupId -First 1000
-    } elseif ($Subscriptions.Count -gt 0) {
-        $subsInScope = Search-AzGraph -Query $subscriptionQuery -Subscription $Subscriptions -First 1000
-    } else {
-        $subsInScope = Search-AzGraph -Query $subscriptionQuery -First 1000
-    }
+    $subsInScope = Invoke-ArgPaged -Query $subscriptionQuery -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
     Write-Log "  Found $($subsInScope.Count) subscriptions in scope:"
     foreach ($sub in $subsInScope) {
         Write-Log "    - $($sub.name) ($($sub.subscriptionId))"
