@@ -9,7 +9,7 @@
     - Idle resources (deallocated VMs, empty App Service Plans)         [Phase 2 scope]
     - Stale resources (old snapshots)                                    [Phase 2 scope]
 
-    TAG MODEL (v1.2.0)
+    TAG MODEL (v1.2.1)
     ==================
     Tags written by this script when a candidate is detected:
         decommission-candidate  = "true"                 [legacy + typed]
@@ -94,11 +94,16 @@
 
 .PARAMETER ExportPath
     Path to write the JSON summary export for consumption by the workflow layer.
-    If empty, defaults to $env:TEMP\decommission-candidates-<timestamp>.json
+    If empty, defaults to the first available temp path from:
+    $env:TEMP, $env:TMPDIR, $env:TMP, [System.IO.Path]::GetTempPath(), /tmp.
 
 .NOTES
-    Version: 1.2.0
+    Version: 1.2.1
     Requires: Az.Accounts, Az.ResourceGraph, Az.Resources, Az.Monitor (for IdleWindowDays > 0)
+
+    Changelog (v1.2.0 -> v1.2.1):
+      - FIX: ExportPath default is now cross-platform and no longer assumes $env:TEMP exists.
+             Linux shells that only set TMPDIR/TMP (or rely on /tmp) now export successfully.
 
     Changelog (v1.1.2 -> v1.2.0):
       - NEW: decommission-reviewed (boolean, written as "false") replaces lifecycle-reviewed (ISO date).
@@ -173,7 +178,7 @@ param(
     [string]$ExportPath = ""
 )
 
-$SCRIPT_VERSION = "1.2.0"
+$SCRIPT_VERSION = "1.2.1"
 
 #region Helper Functions
 
@@ -181,6 +186,32 @@ function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Write-Output "[$timestamp] [$Level] $Message"
+}
+
+function Resolve-DefaultExportDirectory {
+    # Cross-platform temp directory resolution. Some Linux environments do not set $env:TEMP.
+    $candidates = @(
+        $env:TEMP,
+        $env:TMPDIR,
+        $env:TMP,
+        [System.IO.Path]::GetTempPath(),
+        "/tmp",
+        (Get-Location).Path
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+
+    foreach ($candidate in $candidates) {
+        try {
+            if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+                New-Item -Path $candidate -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            }
+            return $candidate
+        }
+        catch {
+            continue
+        }
+    }
+
+    return $null
 }
 
 function Invoke-ArgPaged {
@@ -1178,7 +1209,11 @@ Write-Log ""
 
 # JSON export
 if (-not $ExportPath) {
-    $ExportPath = Join-Path $env:TEMP "decommission-candidates-$($scriptStartTime.ToString('yyyyMMddHHmmss')).json"
+    $exportDir = Resolve-DefaultExportDirectory
+    if (-not $exportDir) {
+        throw "Could not resolve a writable export directory. Provide -ExportPath explicitly."
+    }
+    $ExportPath = Join-Path -Path $exportDir -ChildPath "decommission-candidates-$($scriptStartTime.ToString('yyyyMMddHHmmss')).json"
 }
 $exportEnvelope = [pscustomobject]@{
     schemaVersion         = "1.2"
