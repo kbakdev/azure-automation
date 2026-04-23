@@ -1,141 +1,150 @@
 <#
 .SYNOPSIS
-    Tags unused Azure resources as decommission candidates using a typed lifecycle taxonomy
-    with an owner-driven review workflow.
+    Tags unused Azure resources as decommission candidates using the consolidated
+    decommission-* tag family (v1.3.0 taxonomy).
 
 .DESCRIPTION
-    This runbook queries Azure Resource Graph to identify:
-    - Orphaned resources (unattached disks, NICs, PIPs, NSGs)           [Phase 1 scope]
-    - Idle resources (deallocated VMs, empty App Service Plans)         [Phase 2 scope]
-    - Stale resources (old snapshots)                                    [Phase 2 scope]
+    Scans Azure Resource Graph for:
+      - Orphaned resources (unattached disks, NICs, PIPs, NSGs)    [Phase 1]
+      - Idle resources (deallocated VMs, empty App Service Plans)  [Phase 2]
+      - Stale resources (old snapshots)                             [Phase 2]
 
-    TAG MODEL (v1.2.1)
-    ==================
-    Tags written by this script when a candidate is detected:
-        decommission-candidate  = "true"                 [legacy + typed]
-        decommission-detected   = <YYYY-MM-DD>           [legacy + typed; first-tag date]
-        decommission-reason     = <class-specific code>  [legacy + typed]
-        decommission-owner      = <resolved email or "unresolved">  [typed]
-        decommission-reviewed   = "false"                [typed; set by script, flipped by owner]
-        lifecycle-state         = "candidate"            [typed; state-machine position]
-        lifecycle-reason        = <class-specific code>  [typed; mirrors decommission-reason]
+    TAG MODEL (v1.3.0) — nine tags, each with a single writer and a single semantic
+    ==========================================================================
 
-    Tags owners are expected to set (the script does NOT write these, but reads them):
-        decommission-reviewed   = "true"                 (owner acknowledges they have looked)
-        decommission-disposition = "keep" | "delete" | "extend"
-        lifecycle-state         = "exempt"               (when disposition = "keep")
-        lifecycle-exempt-reason = "dr" | "compliance" | "planned-use" | "external-dep" | "legacy"
+    SCRIPT WRITES (on first detection; owner/reason refreshed on subsequent scans):
+        decommission-reviewed      = "false"
+        decommission-owner         = "<resolved email or 'unresolved'>"
+        decommission-reason        = "orphaned" | "idle" | "stale"
+        decommission-date-detected = YYYY-MM-DD
 
-    EXCLUSION SEMANTICS
-    ===================
-    A resource is skipped by re-scan if ANY of the following hold:
+    OWNER WRITES (per-cycle decision OR standing policy):
+        decommission-reviewed        = "true"
+        decommission-date-reviewed   = YYYY-MM-DD
+        decommission-disposition     = "delete" | "extend" | "exempted"
+        decommission-date-extended   = YYYY-MM-DD       (required when disposition = "extend")
+        decommission-exempted-reason = "dr" | "compliance" | "planned-use" | "external-dep" | "legacy"
+                                                          (required when disposition = "exempted")
+        decommission-date-declared   = YYYY-MM-DD       (set by owner when disposition = "exempted")
+
+    WORKFLOW STATE IS DERIVED, NOT STORED
+    =====================================
+    There is no decommission-state tag. The position in the workflow is computed from
+    the combination of other tags:
+        pending-review           = date-detected set, reviewed = "false" (or absent)
+        reviewed-no-disposition  = reviewed = "true", disposition unset
+        awaiting-delete          = disposition = "delete", date-reviewed not expired
+        extend-active            = disposition = "extend", date-extended in future
+        exempted                 = disposition = "exempted", date-declared within 180d
+
+    EXPIRY POLICIES
+    ===============
+    Three disposition values, three expiry rules, enforced by the script:
+        delete   -> 90 days from date-reviewed; if not executed, reset and re-ask
+        extend   -> at date-extended (capped at +90d from date-reviewed at write time)
+        exempted -> 180 days from date-declared
+
+    On expiry, all three behave identically: disposition and companion tags are cleared,
+    decommission-reviewed is reset to "false", date-detected is refreshed, and the
+    resource re-enters pending-review.
+
+    EXCLUSION SEMANTICS (re-scan)
+    =============================
+    A resource is skipped by re-scan if ANY of:
         - decommission-exclude = "true" (legacy escape hatch)
-        - lifecycle-state = "exempt" (and review has not expired)
-        - decommission-candidate = "true" AND decommission-disposition != "extend"
-        - decommission-reviewed = "true" AND decommission-disposition in ("keep", "delete")
+        - disposition = "delete"   AND date-reviewed + 90d  > today
+        - disposition = "extend"   AND date-extended        > today
+        - disposition = "exempted" AND date-declared + 180d > today
 
-    A resource is re-included if:
-        - decommission-disposition = "extend" (owner requested re-evaluation)
-        - lifecycle-state = "exempt" but decommission-detected is older than ExemptReviewMaxAgeDays
+    A resource is re-included (and its disposition cleared) if any expiry passes,
+    OR if the owner sets disposition = "extend" with a new date-extended in the future.
 
-    IMPORTANT: This runbook does NOT delete resources. It only tags them. Disposition
-    is handled by a downstream workflow that consumes the JSON export from this runbook.
+    IMPORTANT: this runbook does NOT delete resources. disposition = "delete" is
+    recorded but never acted on; the execution layer is deferred.
 
 .PARAMETER DryRun
-    If $true, only reports what would be tagged without making changes.
-    Default: $true (safe by default)
+    If $true, only reports what would be tagged. Default: $true.
 
 .PARAMETER Scope
-    Which resource classes to scan.
-      phase1 = orphan/unattached classes only (Disks, NICs, PIPs, NSGs) - ARG-sufficient, lowest blast radius
-      phase2 = phase1 + idle/stale classes (VMs, ASPs, Snapshots) - requires telemetry corroboration
-      all    = same as phase2 (reserved for future extension)
-    Default: phase1
-
-.PARAMETER TagMode
-    Tag family to write.
-      legacy = decommission-candidate / decommission-detected / decommission-reason
-               + decommission-reviewed (the reviewed flag is always written, regardless of mode)
-      typed  = adds decommission-owner + lifecycle-state + lifecycle-reason
-      dual   = writes the typed superset (kept for backward compat; equivalent to typed)
-    Default: dual
+    phase1 = Disks, NICs, PIPs, NSGs (ARG-sufficient). Default.
+    phase2 = phase1 + VMs, App Service Plans, Snapshots (requires Activity Log).
+    all    = alias for phase2.
 
 .PARAMETER OwnerTagSource
-    Name of the tag (on resource, then RG, then subscription) from which to derive the
-    decommission-owner value. Default: "owner"
+    Tag name (on resource -> RG -> subscription) from which to derive decommission-owner.
+    Default: "owner".
 
 .PARAMETER ManagementGroupId
-    Management Group ID to scan all subscriptions under it.
-    If set, overrides the Subscriptions parameter.
+    Management Group ID to scan. Overrides -Subscriptions if set.
 
 .PARAMETER Subscriptions
-    Array of subscription IDs to scan. If empty and ManagementGroupId not set,
-    scans all accessible subscriptions.
+    Array of subscription IDs. If empty and no MG, scans all accessible subscriptions.
 
 .PARAMETER IdleWindowDays
-    Number of days a VM must be deallocated to be considered idle. Default: 30
-    When > 0 and Scope includes VMs, the runbook enriches ARG results with
-    Activity Log queries to establish the deallocation age. Set to 0 to skip the
-    age check and tag all deallocated VMs regardless of duration.
+    Minimum days a VM must be deallocated to be flagged. Default: 30. Set 0 to disable.
 
 .PARAMETER StaleWindowDays
-    Number of days since creation for snapshots to be considered stale. Default: 90
+    Minimum age of a snapshot to be flagged. Default: 90 days.
 
-.PARAMETER ExemptReviewMaxAgeDays
-    Maximum age (in days) of decommission-detected on an exempt resource before it is
-    demoted back to candidate state. Default: 180
+.PARAMETER DeleteApprovalMaxAgeDays
+    How long a "delete" disposition remains valid. Default: 90 days.
+    After this, the disposition is cleared and the resource re-enters review.
+
+.PARAMETER ExtensionMaxDays
+    Maximum value of (date-extended - date-reviewed). Default: 90 days.
+    Extensions beyond this are capped at write time and logged as warnings.
+
+.PARAMETER ExemptedMaxAgeDays
+    How long an "exempted" disposition remains valid. Default: 180 days.
 
 .PARAMETER ExcludeResourceGroups
-    Array of resource group names to exclude from tagging.
+    Array of RG names to skip.
 
 .PARAMETER ExcludeTagName
-    Resources with this tag set to "true" will be excluded (legacy escape hatch).
-    Default: "decommission-exclude"
+    Tag name whose "true" value excludes a resource. Default: "decommission-exclude".
 
 .PARAMETER ExportPath
-    Path to write the JSON summary export for consumption by the workflow layer.
-    If empty, defaults to the first available temp path from:
-    $env:TEMP, $env:TMPDIR, $env:TMP, [System.IO.Path]::GetTempPath(), /tmp.
+    Where to write the JSON export. If empty, resolves a cross-platform temp dir.
 
 .NOTES
-    Version: 1.2.1
+    Version: 1.3.0
     Requires: Az.Accounts, Az.ResourceGraph, Az.Resources, Az.Monitor (for IdleWindowDays > 0)
 
+    Changelog (v1.2.1 -> v1.3.0):
+      BREAKING — taxonomy consolidation to the nine-tag spec:
+        REMOVED: decommission-state            (derivable from other tags; failed derivability test)
+        REMOVED: decommission-candidate        (redundant with date-detected)
+        REMOVED: lifecycle-state               (no longer mirrored)
+        REMOVED: lifecycle-reason              (no longer mirrored)
+        REMOVED: decommission-detected         (renamed to decommission-date-detected)
+        RENAMED: decommission-reviewed (unchanged semantically, but now always paired with date-reviewed)
+        NEW:     decommission-date-detected    (replaces decommission-detected)
+        NEW:     decommission-date-reviewed    (owner writes when flipping reviewed=true)
+        NEW:     decommission-date-extended    (owner writes when disposition=extend)
+        NEW:     decommission-date-declared    (owner writes when disposition=exempted)
+        NEW:     decommission-exempted-reason  (replaces lifecycle-exempt-reason)
+        CHANGED: decommission-disposition values are now "delete" | "extend" | "exempted"
+                 (removed "keep"; "exempted" absorbs the old lifecycle-state=exempt semantic)
+
+      FUNCTIONAL:
+        NEW: three-way expiry enforcement
+             - delete:   date-reviewed + 90d
+             - extend:   date-extended (capped at +90d from date-reviewed)
+             - exempted: date-declared + 180d
+        NEW: on any expiry, disposition+companion tags are cleared, reviewed reset to "false",
+             date-detected refreshed. Resource re-enters pending-review.
+        NEW: disposition breakdown KPI now reports five buckets:
+             pending-review / reviewed-no-disposition / awaiting-delete / extend-active / exempted
+        NEW: workflow-state derivation is computed; no state tag is written.
+
+      DROPPED:
+        - TagMode parameter (legacy/typed/dual) — only one taxonomy exists now.
+        - MigrateLegacyTags helper — migration is a one-time operation not bundled here.
+
     Changelog (v1.2.0 -> v1.2.1):
-      - FIX: ExportPath default is now cross-platform and no longer assumes $env:TEMP exists.
-             Linux shells that only set TMPDIR/TMP (or rely on /tmp) now export successfully.
+      - FIX: ExportPath default is cross-platform.
 
-    Changelog (v1.1.2 -> v1.2.0):
-      - NEW: decommission-reviewed (boolean, written as "false") replaces lifecycle-reviewed (ISO date).
-             The new field is an owner-acknowledgement flag, not a script-touched timestamp.
-      - NEW: decommission-disposition awareness. The script respects owner-set disposition values
-             (keep / delete / extend) and excludes or re-includes resources accordingly.
-      - NEW: DISPOSITION BREAKDOWN report at end of run, showing estate-wide counts of
-             pending / reviewed-no-disposition / keep / delete / extend.
-      - NEW: decommission-owner is now the authoritative owner tag name (replaces lifecycle-owner)
-             to match the stakeholder communication taxonomy.
-      - CHG: Review-expiry scan rebased on decommission-detected (previously lifecycle-reviewed).
-      - CHG: Version string in runtime log now matches the header version.
-      - FIX: Set-LifecycleStateCandidate now also resets decommission-reviewed to "false" when
-             demoting, so the resource enters a fresh review cycle.
-
-    Changelog (v1.1.1 -> v1.1.2):
-      - FIX: Correctly unwrap Search-AzGraph responses so only row records are processed.
-      - FIX: Harden owner resolution against null/array subscription IDs before cache lookups.
-      - FIX: Make disk size conversion resilient to non-scalar values in cost estimation.
-      - FIX: Repair review-expiry query by casting the review date to datetime before comparison.
-
-    Changelog (v1.1.0 -> v1.1.1):
-      - FIX: Search-AzGraph calls now paginate via SkipToken (previously capped silently at 1000 rows).
-
-    Changelog (v1.0.0 -> v1.1.0):
-      - Added typed lifecycle-* tag family with dual-write migration mode
-      - Added owner derivation from resource/RG/subscription tags
-      - Fixed dead $IdleWindowDays parameter (now enforced via Activity Log when > 0)
-      - Added Scope parameter defaulting to phase1 (ARG-sufficient classes only)
-      - Added review-expiry scan that demotes stale exemptions back to candidate
-      - Added JSON export of scan results for downstream workflow consumption
-      - Removed StaleImages from default scope (cannot verify age from ARG)
+    (Earlier changelog entries retained in v1.2.1; not duplicated here.)
 #>
 
 param(
@@ -145,10 +154,6 @@ param(
     [Parameter(Mandatory = $false)]
     [ValidateSet("phase1", "phase2", "all")]
     [string]$Scope = "phase1",
-
-    [Parameter(Mandatory = $false)]
-    [ValidateSet("legacy", "typed", "dual")]
-    [string]$TagMode = "dual",
 
     [Parameter(Mandatory = $false)]
     [string]$OwnerTagSource = "owner",
@@ -166,7 +171,13 @@ param(
     [int]$StaleWindowDays = 90,
 
     [Parameter(Mandatory = $false)]
-    [int]$ExemptReviewMaxAgeDays = 180,
+    [int]$DeleteApprovalMaxAgeDays = 90,
+
+    [Parameter(Mandatory = $false)]
+    [int]$ExtensionMaxDays = 90,
+
+    [Parameter(Mandatory = $false)]
+    [int]$ExemptedMaxAgeDays = 180,
 
     [Parameter(Mandatory = $false)]
     [string[]]$ExcludeResourceGroups = @(),
@@ -178,7 +189,7 @@ param(
     [string]$ExportPath = ""
 )
 
-$SCRIPT_VERSION = "1.2.1"
+$SCRIPT_VERSION = "1.3.0"
 
 #region Helper Functions
 
@@ -189,7 +200,6 @@ function Write-Log {
 }
 
 function Resolve-DefaultExportDirectory {
-    # Cross-platform temp directory resolution. Some Linux environments do not set $env:TEMP.
     $candidates = @(
         $env:TEMP,
         $env:TMPDIR,
@@ -206,23 +216,18 @@ function Resolve-DefaultExportDirectory {
             }
             return $candidate
         }
-        catch {
-            continue
-        }
+        catch { continue }
     }
-
     return $null
 }
 
 function Invoke-ArgPaged {
-    # Shared pagination helper. Search-AzGraph returns up to 1000 rows per call
-    # and a SkipToken when more remain. We loop until SkipToken is empty.
     param(
         [string]$Query,
         [string]$ManagementGroupId,
         [string[]]$Subscriptions,
         [int]$PageSize = 1000,
-        [int]$MaxPages = 100   # hard cap against runaway queries; 100k rows
+        [int]$MaxPages = 100
     )
 
     $all = New-Object System.Collections.Generic.List[object]
@@ -247,12 +252,10 @@ function Invoke-ArgPaged {
             if ($response.PSObject.Properties.Name -contains 'Data') {
                 $rows = @($response.Data)
                 $skipToken = $response.SkipToken
-            }
-            else {
+            } else {
                 $rows = @($response)
                 $skipToken = $response.SkipToken
             }
-
             foreach ($row in $rows) {
                 if ($null -ne $row) { $all.Add($row) | Out-Null }
             }
@@ -285,9 +288,7 @@ function Get-ResourceGraphResults {
 
 function Get-FirstNonEmptyString {
     param([object]$Value)
-
     if ($null -eq $Value) { return $null }
-
     if ($Value -is [System.Array]) {
         foreach ($candidate in $Value) {
             $s = [string]$candidate
@@ -295,34 +296,26 @@ function Get-FirstNonEmptyString {
         }
         return $null
     }
-
     $single = [string]$Value
     if ([string]::IsNullOrWhiteSpace($single)) { return $null }
     return $single
 }
 
 function Convert-ToIntSafe {
-    param(
-        [object]$Value,
-        [int]$Default = 0
-    )
-
+    param([object]$Value, [int]$Default = 0)
     $scalar = Get-FirstNonEmptyString -Value $Value
     if ($null -eq $scalar) { return $Default }
-
     $parsed = 0
     if ([int]::TryParse($scalar, [ref]$parsed)) { return $parsed }
     return $Default
 }
 
 # --- Owner derivation -------------------------------------------------------
-# Cache per RG and per subscription to avoid re-querying for every resource.
 $script:RgOwnerCache  = @{}
 $script:SubOwnerCache = @{}
 
 function Initialize-SubscriptionOwnerCache {
     param([object[]]$SubsInScope, [string]$OwnerTagSource)
-
     foreach ($sub in $SubsInScope) {
         $ownerValue = $null
         if ($sub.tags -and $sub.tags.PSObject.Properties.Name -contains $OwnerTagSource) {
@@ -362,7 +355,6 @@ function Get-RgOwner {
 function Resolve-DecommissionOwner {
     param([object]$Resource, [string]$OwnerTagSource)
 
-    # 1. Resource-level tag (ARG exposes tags object)
     if ($Resource.PSObject.Properties.Name -contains 'tags' -and $Resource.tags) {
         $tagObj = $Resource.tags
         if ($tagObj.PSObject.Properties.Name -contains $OwnerTagSource) {
@@ -374,52 +366,42 @@ function Resolve-DecommissionOwner {
     $subscriptionId = Get-FirstNonEmptyString -Value $Resource.subscriptionId
     $resourceGroup  = Get-FirstNonEmptyString -Value $Resource.resourceGroup
 
-    # 2. Resource Group tag
     if ($subscriptionId -and $resourceGroup) {
         $rgOwner = Get-RgOwner -SubscriptionId $subscriptionId -ResourceGroup $resourceGroup -OwnerTagSource $OwnerTagSource
         if ($rgOwner) { return $rgOwner }
     }
 
-    # 3. Subscription tag
     if ($subscriptionId -and $script:SubOwnerCache.ContainsKey($subscriptionId)) {
         $subOwner = $script:SubOwnerCache[$subscriptionId]
         if ($subOwner) { return $subOwner }
     }
 
-    # 4. Fallback
     return "unresolved"
 }
 
 # --- Tag application --------------------------------------------------------
 
-function Add-DecommissionTag {
+function Add-DecommissionTags {
+    # Writes the four script-owned tags on a newly detected resource.
+    # Owner-owned tags (reviewed=true, disposition, date-reviewed, date-extended,
+    # date-declared, exempted-reason) are NEVER written by the script.
     param(
         [string]$ResourceId,
         [string]$Reason,
         [string]$Owner,
-        [bool]$DryRun,
-        [string]$TagMode
+        [bool]$DryRun
     )
 
     $today = Get-Date -Format "yyyy-MM-dd"
-    $tags = @{}
-
-    # Always-written fields (regardless of TagMode) -------------------------
-    # These are the workflow primitives the stakeholder communication relies on.
-    $tags["decommission-candidate"] = "true"
-    $tags["decommission-detected"]  = $today
-    $tags["decommission-reason"]    = $Reason
-    $tags["decommission-reviewed"]  = "false"
-
-    # Typed / dual mode adds the state-machine + owner fields ---------------
-    if ($TagMode -in @("typed", "dual")) {
-        $tags["decommission-owner"] = if ($Owner) { $Owner } else { "unresolved" }
-        $tags["lifecycle-state"]    = "candidate"
-        $tags["lifecycle-reason"]   = $Reason
+    $tags = @{
+        "decommission-reviewed"      = "false"
+        "decommission-owner"         = if ($Owner) { $Owner } else { "unresolved" }
+        "decommission-reason"        = $Reason
+        "decommission-date-detected" = $today
     }
 
     if ($DryRun) {
-        Write-Log "[DRY RUN] Would tag: $ResourceId (Reason: $Reason, Owner: $Owner, Mode: $TagMode)" -Level "INFO"
+        Write-Log "[DRY RUN] Would tag: $ResourceId (Reason: $Reason, Owner: $Owner)" -Level "INFO"
         return $true
     }
 
@@ -428,10 +410,8 @@ function Add-DecommissionTag {
         $existingTags = $resource.Tags
         if ($null -eq $existingTags) { $existingTags = @{} }
 
-        # Merge: do not overwrite existing tag keys. This preserves:
-        #   - owner-set decommission-reviewed = "true"
-        #   - owner-set decommission-disposition
-        #   - manually set lifecycle-state = "exempt"
+        # Merge: never overwrite existing keys. This preserves owner-set values
+        # (reviewed=true, disposition, any date-reviewed, etc.) across re-scans.
         foreach ($key in $tags.Keys) {
             if (-not $existingTags.ContainsKey($key)) {
                 $existingTags[$key] = $tags[$key]
@@ -448,19 +428,19 @@ function Add-DecommissionTag {
     }
 }
 
-function Set-LifecycleStateCandidate {
-    # Used by the review-expiry scan to flip an expired "exempt" back to "candidate".
-    # Also resets decommission-reviewed to "false" so the resource enters a fresh
-    # review cycle (the previous review is considered stale by definition).
+function Reset-ExpiredDisposition {
+    # Used by the expiry scans. Clears all owner-owned disposition tags, resets
+    # reviewed to "false", and refreshes date-detected. The resource re-enters
+    # pending-review on the next scan.
     param(
         [string]$ResourceId,
-        [string]$Reason,
+        [string]$ExpiryReason,
         [bool]$DryRun
     )
 
     $today = Get-Date -Format "yyyy-MM-dd"
     if ($DryRun) {
-        Write-Log "[DRY RUN] Would demote exempt->candidate: $ResourceId (Reason: $Reason)" -Level "INFO"
+        Write-Log "[DRY RUN] Would reset expired disposition: $ResourceId ($ExpiryReason)" -Level "INFO"
         return $true
     }
 
@@ -469,21 +449,29 @@ function Set-LifecycleStateCandidate {
         $existingTags = $resource.Tags
         if ($null -eq $existingTags) { $existingTags = @{} }
 
-        $existingTags["lifecycle-state"]         = "candidate"
-        $existingTags["lifecycle-reason"]        = $Reason
-        $existingTags["decommission-candidate"]  = "true"
-        $existingTags["decommission-reason"]     = $Reason
-        $existingTags["decommission-detected"]   = $today
-        $existingTags["decommission-reviewed"]   = "false"
-        # Intentionally do NOT touch decommission-disposition; it will be
-        # overwritten by the owner in the next review cycle.
+        # Clear owner-owned disposition tags
+        foreach ($ownerTag in @(
+            "decommission-disposition",
+            "decommission-date-reviewed",
+            "decommission-date-extended",
+            "decommission-date-declared",
+            "decommission-exempted-reason"
+        )) {
+            if ($existingTags.ContainsKey($ownerTag)) {
+                $existingTags.Remove($ownerTag) | Out-Null
+            }
+        }
+
+        # Reset script-owned state to "fresh candidate"
+        $existingTags["decommission-reviewed"]      = "false"
+        $existingTags["decommission-date-detected"] = $today
 
         Set-AzResource -ResourceId $ResourceId -Tag $existingTags -Force -ErrorAction Stop | Out-Null
-        Write-Log "Demoted exempt->candidate: $ResourceId (Reason: $Reason)" -Level "SUCCESS"
+        Write-Log "Reset expired disposition: $ResourceId ($ExpiryReason)" -Level "SUCCESS"
         return $true
     }
     catch {
-        Write-Log "Failed to demote $ResourceId : $($_.Exception.Message)" -Level "ERROR"
+        Write-Log "Failed to reset $ResourceId : $($_.Exception.Message)" -Level "ERROR"
         return $false
     }
 }
@@ -491,12 +479,9 @@ function Set-LifecycleStateCandidate {
 # --- VM deallocation age via Activity Log -----------------------------------
 
 function Test-VmDeallocatedLongerThan {
-    param(
-        [object]$Vm,
-        [int]$IdleWindowDays
-    )
+    param([object]$Vm, [int]$IdleWindowDays)
 
-    if ($IdleWindowDays -le 0) { return $true }  # age check disabled
+    if ($IdleWindowDays -le 0) { return $true }
 
     try {
         $currentCtx = Get-AzContext
@@ -504,15 +489,12 @@ function Test-VmDeallocatedLongerThan {
             Set-AzContext -SubscriptionId $Vm.subscriptionId -ErrorAction Stop | Out-Null
         }
 
-        # Activity Log retention is 90 days. If we don't find a deallocate event in that window,
-        # the VM has been deallocated for at least 90 days -> treat as idle.
         $windowStart = (Get-Date).AddDays(-90)
         $events = Get-AzActivityLog -ResourceId $Vm.id -StartTime $windowStart -WarningAction SilentlyContinue -ErrorAction Stop |
             Where-Object { $_.OperationName.Value -eq 'Microsoft.Compute/virtualMachines/deallocate/action' -and $_.Status.Value -eq 'Succeeded' } |
             Sort-Object EventTimestamp -Descending
 
         if (-not $events -or $events.Count -eq 0) {
-            # No deallocate event in last 90 days -> has been deallocated for >=90 days
             return $IdleWindowDays -le 90
         }
 
@@ -522,7 +504,7 @@ function Test-VmDeallocatedLongerThan {
     }
     catch {
         Write-Log "Could not determine deallocation age for $($Vm.id): $($_.Exception.Message). Excluding from tagging." -Level "WARN"
-        return $false  # fail-safe: if we can't determine age, do not tag
+        return $false
     }
 }
 
@@ -533,29 +515,27 @@ function Test-VmDeallocatedLongerThan {
 $scriptStartTime = Get-Date
 
 Write-Log "============================================================"
-Write-Log "     UNUSED RESOURCE TAGGING AUTOMATION (v$SCRIPT_VERSION)"
+Write-Log "     DECOMMISSION CANDIDATE TAGGER (v$SCRIPT_VERSION)"
 Write-Log "============================================================"
 Write-Log ""
 Write-Log "CONFIGURATION:"
 Write-Log "  DryRun Mode:              $DryRun $(if ($DryRun) { '(no changes will be made)' } else { '*** LIVE MODE - TAGS WILL BE APPLIED ***' })"
 Write-Log "  Scope:                    $Scope"
-Write-Log "  TagMode:                  $TagMode"
 Write-Log "  OwnerTagSource:           $OwnerTagSource"
-Write-Log "  Idle Window:              $IdleWindowDays days $(if ($IdleWindowDays -eq 0) { '(age check disabled)' })"
+Write-Log "  Idle Window:              $IdleWindowDays days $(if ($IdleWindowDays -eq 0) { '(disabled)' })"
 Write-Log "  Stale Window:             $StaleWindowDays days"
-Write-Log "  Exempt Review Max Age:    $ExemptReviewMaxAgeDays days"
+Write-Log "  Delete Approval Max Age:  $DeleteApprovalMaxAgeDays days"
+Write-Log "  Extension Max Days:       $ExtensionMaxDays days"
+Write-Log "  Exempted Max Age:         $ExemptedMaxAgeDays days"
 Write-Log "  Exclude Tag:              $ExcludeTagName"
 Write-Log "  Exclude RGs:              $(if ($ExcludeResourceGroups.Count -gt 0) { $ExcludeResourceGroups -join ', ' } else { '(none)' })"
 Write-Log ""
 Write-Log "SCOPE:"
 if ($ManagementGroupId) {
     Write-Log "  Management Group:         $ManagementGroupId"
-    Write-Log "  (All subscriptions under this MG hierarchy will be scanned)"
 } elseif ($Subscriptions.Count -gt 0) {
     Write-Log "  Subscriptions:            $($Subscriptions.Count) specified"
-    foreach ($sub in $Subscriptions) {
-        Write-Log "    - $sub"
-    }
+    foreach ($sub in $Subscriptions) { Write-Log "    - $sub" }
 } else {
     Write-Log "  Subscriptions:            All accessible to current identity"
 }
@@ -577,7 +557,6 @@ catch {
 }
 Write-Log ""
 
-# Initialize subscription-level owner cache
 Initialize-SubscriptionOwnerCache -SubsInScope $subsInScope -OwnerTagSource $OwnerTagSource
 
 # Build exclusion filter
@@ -591,36 +570,39 @@ if ($ExcludeResourceGroups.Count -gt 0) {
     Write-Log "  Excluded Resource Groups: (none)"
 }
 Write-Log "  Excluded by Tag:          Resources with '$ExcludeTagName = true'"
-Write-Log "  Excluded by State:        Resources with 'lifecycle-state = exempt' (unless review expired)"
-Write-Log "  Excluded by Disposition:  Resources with decommission-reviewed=true AND disposition in (keep, delete)"
-Write-Log "  Re-included:              Resources with decommission-disposition = extend (owner requested re-scan)"
-Write-Log "  Skipped:                  Resources already tagged candidate (unless disposition = extend)"
+Write-Log "  Excluded by disposition:  delete (within 90d), extend (before date-extended), exempted (within 180d)"
+Write-Log "  Re-included:              Any disposition whose expiry has passed"
 Write-Log ""
 
-# --- KQL filter fragments ---------------------------------------------------
-$excludeTagFilter    = "| where isnull(tags['$ExcludeTagName']) or tags['$ExcludeTagName'] != 'true'"
-$excludeExemptFilter = "| where isnull(tags['lifecycle-state']) or tags['lifecycle-state'] != 'exempt'"
+# --- KQL filter fragments (v1.3.0 nine-tag spec) ---------------------------
+$today = Get-Date -Format "yyyy-MM-dd"
+$deleteExpiryDate   = (Get-Date).AddDays(-$DeleteApprovalMaxAgeDays).ToString("yyyy-MM-dd")
+$exemptedExpiryDate = (Get-Date).AddDays(-$ExemptedMaxAgeDays).ToString("yyyy-MM-dd")
 
-# Skip already-tagged candidates UNLESS the owner set disposition = extend
-$alreadyTaggedFilter = @"
-| where (
-    (isnull(tags['decommission-candidate']) or tostring(tags['decommission-candidate']) != 'true')
-    or tostring(tags['decommission-disposition']) == 'extend'
+$excludeTagFilter = "| where isnull(tags['$ExcludeTagName']) or tags['$ExcludeTagName'] != 'true'"
+
+# Skip resources where the owner's disposition is still within its validity window.
+# Three cases, all with explicit date bounds — no implicit forever-valid dispositions.
+$activeDispositionFilter = @"
+| where not (
+    (tostring(tags['decommission-disposition']) == 'delete'
+      and todatetime(tostring(tags['decommission-date-reviewed'])) >= datetime('$deleteExpiryDate'))
+    or (tostring(tags['decommission-disposition']) == 'extend'
+      and todatetime(tostring(tags['decommission-date-extended'])) > now())
+    or (tostring(tags['decommission-disposition']) == 'exempted'
+      and todatetime(tostring(tags['decommission-date-declared'])) >= datetime('$exemptedExpiryDate'))
   )
 "@
 
-# Skip resources where the owner has already decided (keep / delete)
-$dispositionFilter = @"
-| where not (
-    tostring(tags['decommission-reviewed']) == 'true'
-    and tostring(tags['decommission-disposition']) in~ ('keep', 'delete')
-  )
+# Skip resources already tagged as pending-review (date-detected set, no disposition yet).
+# These are handled by the existing review cycle; do not re-tag.
+$alreadyPendingFilter = @"
+| where isnull(tags['decommission-date-detected'])
 "@
 
 # Determine class list from Scope
 $phase1Classes = @("UnattachedDisks", "OrphanNICs", "OrphanPIPs", "OrphanNSGs")
 $phase2Classes = $phase1Classes + @("DeallocatedVMs", "EmptyASPs", "StaleSnapshots")
-# StaleImages deliberately excluded: ARG cannot verify age.
 $activeClasses = switch ($Scope) {
     "phase1" { $phase1Classes }
     "phase2" { $phase2Classes }
@@ -629,10 +611,10 @@ $activeClasses = switch ($Scope) {
 Write-Log "ACTIVE CLASSES: $($activeClasses -join ', ')"
 Write-Log ""
 
-# Track results with details
+# Track results
 $summary = @{}
-foreach ($c in @("UnattachedDisks","OrphanNICs","OrphanPIPs","OrphanNSGs","DeallocatedVMs","EmptyASPs","StaleSnapshots","StaleImages","ReviewExpired")) {
-    $summary[$c] = @{ Found = 0; Tagged = 0; Skipped = 0; Details = @() }
+foreach ($c in @("UnattachedDisks","OrphanNICs","OrphanPIPs","OrphanNSGs","DeallocatedVMs","EmptyASPs","StaleSnapshots","ExpiredDelete","ExpiredExtend","ExpiredExempted")) {
+    $summary[$c] = @{ Found = 0; Tagged = 0; Skipped = 0 }
 }
 
 $costEstimates = @{
@@ -657,34 +639,30 @@ function Get-EstimatedMonthlyCost {
         "Disk" {
             $sizeGB = Convert-ToIntSafe -Value $Resource.diskSizeGB -Default 0
             $sku = $Resource.sku_name
-
             if ($sku -match "Premium") {
-                if ($sizeGB -le 32)    { return 5.28 }
-                elseif ($sizeGB -le 64)    { return 10.21 }
-                elseif ($sizeGB -le 128)   { return 19.71 }
-                elseif ($sizeGB -le 256)   { return 38.02 }
-                elseif ($sizeGB -le 512)   { return 73.22 }
-                elseif ($sizeGB -le 1024)  { return 140.74 }
-                elseif ($sizeGB -le 2048)  { return 270.34 }
-                else                       { return 519.48 }
-            }
-            elseif ($sku -match "StandardSSD") {
-                if ($sizeGB -le 32)    { return 2.40 }
-                elseif ($sizeGB -le 64)    { return 4.80 }
-                elseif ($sizeGB -le 128)   { return 9.60 }
-                elseif ($sizeGB -le 256)   { return 18.43 }
-                elseif ($sizeGB -le 512)   { return 35.33 }
-                elseif ($sizeGB -le 1024)  { return 67.58 }
-                else                       { return 129.54 }
-            }
-            else {
+                if ($sizeGB -le 32)   { return 5.28 }
+                elseif ($sizeGB -le 64)   { return 10.21 }
+                elseif ($sizeGB -le 128)  { return 19.71 }
+                elseif ($sizeGB -le 256)  { return 38.02 }
+                elseif ($sizeGB -le 512)  { return 73.22 }
+                elseif ($sizeGB -le 1024) { return 140.74 }
+                elseif ($sizeGB -le 2048) { return 270.34 }
+                else                      { return 519.48 }
+            } elseif ($sku -match "StandardSSD") {
+                if ($sizeGB -le 32)   { return 2.40 }
+                elseif ($sizeGB -le 64)   { return 4.80 }
+                elseif ($sizeGB -le 128)  { return 9.60 }
+                elseif ($sizeGB -le 256)  { return 18.43 }
+                elseif ($sizeGB -le 512)  { return 35.33 }
+                elseif ($sizeGB -le 1024) { return 67.58 }
+                else                      { return 129.54 }
+            } else {
                 return $sizeGB * 0.04
             }
         }
         "PublicIP" {
             $sku = $Resource.sku_name
-            if ($sku -eq "Standard") { return 3.65 }
-            else                     { return 2.63 }
+            if ($sku -eq "Standard") { return 3.65 } else { return 2.63 }
         }
         "VM" {
             $vmSize = $Resource.vmSize
@@ -777,7 +755,6 @@ Write-Log "                   SCANNING RESOURCES"
 Write-Log "============================================================"
 Write-Log ""
 
-# Capture all candidate records for JSON export
 $exportRecords = New-Object System.Collections.Generic.List[object]
 
 function Add-ExportRecord {
@@ -798,6 +775,9 @@ function Add-ExportRecord {
 
 #region Phase 1 classes (orphan / unattached)
 
+# Reason vocabulary (owner-facing): "orphaned" | "idle" | "stale"
+# Detector vocabulary (script-facing; reserved for future splitting): class-specific codes
+
 if ("UnattachedDisks" -in $activeClasses) {
     Write-Log "[UNATTACHED MANAGED DISKS]"
     Write-Log "    Criteria: Disk not attached to any VM (diskState = 'Unattached')"
@@ -809,9 +789,8 @@ resources
 | where properties.diskState == 'Unattached'
 $excludeRgFilter
 $excludeTagFilter
-$excludeExemptFilter
-$dispositionFilter
-$alreadyTaggedFilter
+$activeDispositionFilter
+$alreadyPendingFilter
 | project id, name, resourceGroup, location, subscriptionId, tags, sku_name=sku.name, diskSizeGB=properties.diskSizeGB
 "@
     $disks = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
@@ -823,10 +802,10 @@ $alreadyTaggedFilter
     foreach ($disk in $disks) {
         $owner = Resolve-DecommissionOwner -Resource $disk -OwnerTagSource $OwnerTagSource
         $cost  = Get-EstimatedMonthlyCost -ResourceType "Disk" -Resource $disk
-        $ok    = Add-DecommissionTag -ResourceId $disk.id -Reason "Orphan-UnattachedDisk" -Owner $owner -DryRun $DryRun -TagMode $TagMode
+        $ok    = Add-DecommissionTags -ResourceId $disk.id -Reason "orphaned" -Owner $owner -DryRun $DryRun
         if ($ok) { $summary["UnattachedDisks"].Tagged++ }
         $costEstimates["UnattachedDisks"] += $cost
-        Add-ExportRecord -Category "UnattachedDisks" -Resource $disk -Reason "Orphan-UnattachedDisk" -Owner $owner -EstCostMonth $cost
+        Add-ExportRecord -Category "UnattachedDisks" -Resource $disk -Reason "orphaned" -Owner $owner -EstCostMonth $cost
     }
     Write-Log ""
 }
@@ -842,9 +821,8 @@ resources
 | where isnull(properties.privateEndpoint.id) or properties.privateEndpoint.id == ''
 $excludeRgFilter
 $excludeTagFilter
-$excludeExemptFilter
-$dispositionFilter
-$alreadyTaggedFilter
+$activeDispositionFilter
+$alreadyPendingFilter
 | project id, name, resourceGroup, location, subscriptionId, tags
 "@
     $nics = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
@@ -855,9 +833,9 @@ $alreadyTaggedFilter
 
     foreach ($nic in $nics) {
         $owner = Resolve-DecommissionOwner -Resource $nic -OwnerTagSource $OwnerTagSource
-        $ok    = Add-DecommissionTag -ResourceId $nic.id -Reason "Orphan-NoVMAttached" -Owner $owner -DryRun $DryRun -TagMode $TagMode
+        $ok    = Add-DecommissionTags -ResourceId $nic.id -Reason "orphaned" -Owner $owner -DryRun $DryRun
         if ($ok) { $summary["OrphanNICs"].Tagged++ }
-        Add-ExportRecord -Category "OrphanNICs" -Resource $nic -Reason "Orphan-NoVMAttached" -Owner $owner -EstCostMonth 0.0
+        Add-ExportRecord -Category "OrphanNICs" -Resource $nic -Reason "orphaned" -Owner $owner -EstCostMonth 0.0
     }
     Write-Log ""
 }
@@ -873,9 +851,8 @@ resources
 | where isnull(properties.natGateway.id) or properties.natGateway.id == ''
 $excludeRgFilter
 $excludeTagFilter
-$excludeExemptFilter
-$dispositionFilter
-$alreadyTaggedFilter
+$activeDispositionFilter
+$alreadyPendingFilter
 | project id, name, resourceGroup, location, subscriptionId, tags, sku_name=sku.name
 "@
     $pips = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
@@ -887,10 +864,10 @@ $alreadyTaggedFilter
     foreach ($pip in $pips) {
         $owner = Resolve-DecommissionOwner -Resource $pip -OwnerTagSource $OwnerTagSource
         $cost  = Get-EstimatedMonthlyCost -ResourceType "PublicIP" -Resource $pip
-        $ok    = Add-DecommissionTag -ResourceId $pip.id -Reason "Orphan-NotAssociated" -Owner $owner -DryRun $DryRun -TagMode $TagMode
+        $ok    = Add-DecommissionTags -ResourceId $pip.id -Reason "orphaned" -Owner $owner -DryRun $DryRun
         if ($ok) { $summary["OrphanPIPs"].Tagged++ }
         $costEstimates["OrphanPIPs"] += $cost
-        Add-ExportRecord -Category "OrphanPIPs" -Resource $pip -Reason "Orphan-NotAssociated" -Owner $owner -EstCostMonth $cost
+        Add-ExportRecord -Category "OrphanPIPs" -Resource $pip -Reason "orphaned" -Owner $owner -EstCostMonth $cost
     }
     Write-Log ""
 }
@@ -906,9 +883,8 @@ resources
 | where isnull(properties.networkInterfaces) or array_length(properties.networkInterfaces) == 0
 $excludeRgFilter
 $excludeTagFilter
-$excludeExemptFilter
-$dispositionFilter
-$alreadyTaggedFilter
+$activeDispositionFilter
+$alreadyPendingFilter
 | project id, name, resourceGroup, location, subscriptionId, tags
 "@
     $nsgs = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
@@ -919,9 +895,9 @@ $alreadyTaggedFilter
 
     foreach ($nsg in $nsgs) {
         $owner = Resolve-DecommissionOwner -Resource $nsg -OwnerTagSource $OwnerTagSource
-        $ok    = Add-DecommissionTag -ResourceId $nsg.id -Reason "Orphan-NotAttached" -Owner $owner -DryRun $DryRun -TagMode $TagMode
+        $ok    = Add-DecommissionTags -ResourceId $nsg.id -Reason "orphaned" -Owner $owner -DryRun $DryRun
         if ($ok) { $summary["OrphanNSGs"].Tagged++ }
-        Add-ExportRecord -Category "OrphanNSGs" -Resource $nsg -Reason "Orphan-NotAttached" -Owner $owner -EstCostMonth 0.0
+        Add-ExportRecord -Category "OrphanNSGs" -Resource $nsg -Reason "orphaned" -Owner $owner -EstCostMonth 0.0
     }
     Write-Log ""
 }
@@ -933,7 +909,7 @@ $alreadyTaggedFilter
 if ("DeallocatedVMs" -in $activeClasses) {
     Write-Log "[DEALLOCATED VIRTUAL MACHINES]"
     if ($IdleWindowDays -gt 0) {
-        Write-Log "    Criteria: VM in 'Deallocated' power state for >= $IdleWindowDays days (Activity Log corroborated)"
+        Write-Log "    Criteria: VM deallocated for >= $IdleWindowDays days (Activity Log corroborated)"
     } else {
         Write-Log "    Criteria: VM in 'Deallocated' power state (age check disabled)"
     }
@@ -944,14 +920,12 @@ resources
 | where properties.extended.instanceView.powerState.code =~ 'PowerState/deallocated'
 $excludeRgFilter
 $excludeTagFilter
-$excludeExemptFilter
-$dispositionFilter
-$alreadyTaggedFilter
+$activeDispositionFilter
+$alreadyPendingFilter
 | project id, name, resourceGroup, location, subscriptionId, tags, vmSize=properties.hardwareProfile.vmSize
 "@
     $vmsAll = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
 
-    # Enforce idle-window via Activity Log
     $vms = @()
     $skippedForAge = 0
     foreach ($vm in $vmsAll) {
@@ -971,10 +945,10 @@ $alreadyTaggedFilter
     foreach ($vm in $vms) {
         $owner = Resolve-DecommissionOwner -Resource $vm -OwnerTagSource $OwnerTagSource
         $cost  = Get-EstimatedMonthlyCost -ResourceType "VM" -Resource $vm
-        $ok    = Add-DecommissionTag -ResourceId $vm.id -Reason "Idle-DeallocatedGt${IdleWindowDays}d" -Owner $owner -DryRun $DryRun -TagMode $TagMode
+        $ok    = Add-DecommissionTags -ResourceId $vm.id -Reason "idle" -Owner $owner -DryRun $DryRun
         if ($ok) { $summary["DeallocatedVMs"].Tagged++ }
         $costEstimates["DeallocatedVMs"] += $cost
-        Add-ExportRecord -Category "DeallocatedVMs" -Resource $vm -Reason "Idle-DeallocatedGt${IdleWindowDays}d" -Owner $owner -EstCostMonth $cost
+        Add-ExportRecord -Category "DeallocatedVMs" -Resource $vm -Reason "idle" -Owner $owner -EstCostMonth $cost
     }
     Write-Log ""
 }
@@ -989,9 +963,8 @@ resources
 | where properties.numberOfSites == 0
 $excludeRgFilter
 $excludeTagFilter
-$excludeExemptFilter
-$dispositionFilter
-$alreadyTaggedFilter
+$activeDispositionFilter
+$alreadyPendingFilter
 | project id, name, resourceGroup, location, subscriptionId, tags, sku_name=sku.name
 "@
     $asps = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
@@ -1003,10 +976,10 @@ $alreadyTaggedFilter
     foreach ($asp in $asps) {
         $owner = Resolve-DecommissionOwner -Resource $asp -OwnerTagSource $OwnerTagSource
         $cost  = Get-EstimatedMonthlyCost -ResourceType "AppServicePlan" -Resource $asp
-        $ok    = Add-DecommissionTag -ResourceId $asp.id -Reason "Idle-NoAppsHosted" -Owner $owner -DryRun $DryRun -TagMode $TagMode
+        $ok    = Add-DecommissionTags -ResourceId $asp.id -Reason "idle" -Owner $owner -DryRun $DryRun
         if ($ok) { $summary["EmptyASPs"].Tagged++ }
         $costEstimates["EmptyASPs"] += $cost
-        Add-ExportRecord -Category "EmptyASPs" -Resource $asp -Reason "Idle-NoAppsHosted" -Owner $owner -EstCostMonth $cost
+        Add-ExportRecord -Category "EmptyASPs" -Resource $asp -Reason "idle" -Owner $owner -EstCostMonth $cost
     }
     Write-Log ""
 }
@@ -1023,9 +996,8 @@ resources
 | where properties.timeCreated < datetime('$staleDate')
 $excludeRgFilter
 $excludeTagFilter
-$excludeExemptFilter
-$dispositionFilter
-$alreadyTaggedFilter
+$activeDispositionFilter
+$alreadyPendingFilter
 | project id, name, resourceGroup, location, subscriptionId, tags, diskSizeGB=properties.diskSizeGB, timeCreated=properties.timeCreated
 "@
     $snapshots = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
@@ -1037,69 +1009,112 @@ $alreadyTaggedFilter
     foreach ($snapshot in $snapshots) {
         $owner = Resolve-DecommissionOwner -Resource $snapshot -OwnerTagSource $OwnerTagSource
         $cost  = Get-EstimatedMonthlyCost -ResourceType "Snapshot" -Resource $snapshot
-        $ok    = Add-DecommissionTag -ResourceId $snapshot.id -Reason "Stale-OlderThan${StaleWindowDays}Days" -Owner $owner -DryRun $DryRun -TagMode $TagMode
+        $ok    = Add-DecommissionTags -ResourceId $snapshot.id -Reason "stale" -Owner $owner -DryRun $DryRun
         if ($ok) { $summary["StaleSnapshots"].Tagged++ }
         $costEstimates["StaleSnapshots"] += $cost
-        Add-ExportRecord -Category "StaleSnapshots" -Resource $snapshot -Reason "Stale-OlderThan${StaleWindowDays}Days" -Owner $owner -EstCostMonth $cost
+        Add-ExportRecord -Category "StaleSnapshots" -Resource $snapshot -Reason "stale" -Owner $owner -EstCostMonth $cost
     }
     Write-Log ""
 }
 
-# StaleImages intentionally excluded: ARG does not expose creation date.
-# Re-introduce once the Activity-Log-based age enrichment is implemented for this class.
-
 #endregion
 
-#region Review-expiry scan (typed/dual tag mode only)
+#region Expiry scans (three parallel scans, one per disposition value)
 
-if ($TagMode -in @("typed", "dual")) {
-    Write-Log "[REVIEW-EXPIRY SCAN]"
-    Write-Log "    Criteria: lifecycle-state = 'exempt' AND decommission-detected older than $ExemptReviewMaxAgeDays days"
-    $scanStart = Get-Date
-    $expiryDate = (Get-Date).AddDays(-$ExemptReviewMaxAgeDays).ToString("yyyy-MM-dd")
+# Each expiry scan behaves identically: find resources whose disposition window
+# has passed, clear the disposition tags, reset reviewed to "false", refresh
+# date-detected. The resource re-enters pending-review.
 
-    $query = @"
+# 1. Expired delete approvals (disposition = delete, date-reviewed older than 90d)
+Write-Log "[EXPIRY SCAN - delete approvals]"
+Write-Log "    Criteria: disposition = 'delete' AND date-reviewed older than $DeleteApprovalMaxAgeDays days"
+$scanStart = Get-Date
+$query = @"
 resources
-| where tags['lifecycle-state'] == 'exempt'
-| extend detectedAt = todatetime(tostring(tags['decommission-detected']))
-| where isnull(detectedAt) or detectedAt < datetime('$expiryDate')
+| where tostring(tags['decommission-disposition']) == 'delete'
+| extend reviewedAt = todatetime(tostring(tags['decommission-date-reviewed']))
+| where isnull(reviewedAt) or reviewedAt < datetime('$deleteExpiryDate')
 $excludeRgFilter
 | project id, name, resourceGroup, location, subscriptionId, tags
 "@
-    $expired = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
-    $scanDuration = ((Get-Date) - $scanStart).TotalSeconds
-    $summary["ReviewExpired"].Found = $expired.Count
-    Write-Log "    Found: $($expired.Count) exempt resources past review window (scan took $([math]::Round($scanDuration, 2))s)"
-    Write-ResourceTable -Category "ReviewExpired" -Resources $expired -ExtraFields @{}
-
-    foreach ($r in $expired) {
-        $ok = Set-LifecycleStateCandidate -ResourceId $r.id -Reason "Review-Expired" -DryRun $DryRun
-        if ($ok) { $summary["ReviewExpired"].Tagged++ }
-        Add-ExportRecord -Category "ReviewExpired" -Resource $r -Reason "Review-Expired" -Owner "review-required" -EstCostMonth 0.0
-    }
-    Write-Log ""
+$expiredDelete = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
+$scanDuration = ((Get-Date) - $scanStart).TotalSeconds
+$summary["ExpiredDelete"].Found = $expiredDelete.Count
+Write-Log "    Found: $($expiredDelete.Count) expired delete approvals (scan took $([math]::Round($scanDuration, 2))s)"
+foreach ($r in $expiredDelete) {
+    $ok = Reset-ExpiredDisposition -ResourceId $r.id -ExpiryReason "delete-approval-expired" -DryRun $DryRun
+    if ($ok) { $summary["ExpiredDelete"].Tagged++ }
+    Add-ExportRecord -Category "ExpiredDelete" -Resource $r -Reason "delete-approval-expired" -Owner "review-required" -EstCostMonth 0.0
 }
+Write-Log ""
+
+# 2. Expired extensions (disposition = extend, date-extended in the past)
+Write-Log "[EXPIRY SCAN - extensions]"
+Write-Log "    Criteria: disposition = 'extend' AND date-extended < today"
+$scanStart = Get-Date
+$query = @"
+resources
+| where tostring(tags['decommission-disposition']) == 'extend'
+| extend extendedUntil = todatetime(tostring(tags['decommission-date-extended']))
+| where isnull(extendedUntil) or extendedUntil <= now()
+$excludeRgFilter
+| project id, name, resourceGroup, location, subscriptionId, tags
+"@
+$expiredExtend = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
+$scanDuration = ((Get-Date) - $scanStart).TotalSeconds
+$summary["ExpiredExtend"].Found = $expiredExtend.Count
+Write-Log "    Found: $($expiredExtend.Count) expired extensions (scan took $([math]::Round($scanDuration, 2))s)"
+foreach ($r in $expiredExtend) {
+    $ok = Reset-ExpiredDisposition -ResourceId $r.id -ExpiryReason "extension-expired" -DryRun $DryRun
+    if ($ok) { $summary["ExpiredExtend"].Tagged++ }
+    Add-ExportRecord -Category "ExpiredExtend" -Resource $r -Reason "extension-expired" -Owner "review-required" -EstCostMonth 0.0
+}
+Write-Log ""
+
+# 3. Expired exemptions (disposition = exempted, date-declared older than 180d)
+Write-Log "[EXPIRY SCAN - exemptions]"
+Write-Log "    Criteria: disposition = 'exempted' AND date-declared older than $ExemptedMaxAgeDays days"
+$scanStart = Get-Date
+$query = @"
+resources
+| where tostring(tags['decommission-disposition']) == 'exempted'
+| extend declaredAt = todatetime(tostring(tags['decommission-date-declared']))
+| where isnull(declaredAt) or declaredAt < datetime('$exemptedExpiryDate')
+$excludeRgFilter
+| project id, name, resourceGroup, location, subscriptionId, tags
+"@
+$expiredExempted = Get-ResourceGraphResults -Query $query -ManagementGroupId $ManagementGroupId -Subscriptions $Subscriptions
+$scanDuration = ((Get-Date) - $scanStart).TotalSeconds
+$summary["ExpiredExempted"].Found = $expiredExempted.Count
+Write-Log "    Found: $($expiredExempted.Count) expired exemptions (scan took $([math]::Round($scanDuration, 2))s)"
+foreach ($r in $expiredExempted) {
+    $ok = Reset-ExpiredDisposition -ResourceId $r.id -ExpiryReason "exemption-expired" -DryRun $DryRun
+    if ($ok) { $summary["ExpiredExempted"].Tagged++ }
+    Add-ExportRecord -Category "ExpiredExempted" -Resource $r -Reason "exemption-expired" -Owner "review-required" -EstCostMonth 0.0
+}
+Write-Log ""
 
 #endregion
 
-#region Disposition breakdown (estate-wide snapshot)
+#region Disposition breakdown (estate-wide snapshot of the derived workflow state)
 
-# Read-only scan: does not tag, reports the current workflow state across the estate.
-# This is the primary governance KPI: how many candidates are pending vs. decided.
+# Workflow state is DERIVED from the tag combination, not stored. This scan
+# computes the state on the fly for governance reporting.
 Write-Log "[DISPOSITION BREAKDOWN - estate-wide snapshot]"
 $scanStart = Get-Date
 $dispositionQuery = @"
 resources
-| where tostring(tags['decommission-candidate']) == 'true'
+| where isnotnull(tags['decommission-date-detected'])
 $excludeRgFilter
 | extend reviewed    = tostring(tags['decommission-reviewed'])
 | extend disposition = tostring(tags['decommission-disposition'])
 | extend bucket = case(
-    reviewed != 'true', 'pending-review',
-    disposition == 'keep', 'keep',
-    disposition == 'delete', 'awaiting-delete',
-    disposition == 'extend', 'extend-requested',
-    'reviewed-no-disposition'
+    reviewed != 'true' and isempty(disposition), 'pending-review',
+    reviewed == 'true' and isempty(disposition), 'reviewed-no-disposition',
+    disposition == 'delete',   'awaiting-delete',
+    disposition == 'extend',   'extend-active',
+    disposition == 'exempted', 'exempted',
+    'other'
   )
 | summarize count = count() by bucket
 "@
@@ -1109,9 +1124,10 @@ $scanDuration = ((Get-Date) - $scanStart).TotalSeconds
 $dispositionTotals = @{
     "pending-review"          = 0
     "reviewed-no-disposition" = 0
-    "keep"                    = 0
     "awaiting-delete"         = 0
-    "extend-requested"        = 0
+    "extend-active"           = 0
+    "exempted"                = 0
+    "other"                   = 0
 }
 foreach ($row in $dispositionBreakdown) {
     $bucket = [string]$row.bucket
@@ -1123,9 +1139,9 @@ foreach ($row in $dispositionBreakdown) {
 
 Write-Log "    Scan took $([math]::Round($scanDuration, 2))s"
 Write-Log "    +------------------------------+---------+"
-Write-Log "    | Disposition                  |  Count  |"
+Write-Log "    | Workflow state               |  Count  |"
 Write-Log "    +------------------------------+---------+"
-$orderedBuckets = @("pending-review","reviewed-no-disposition","keep","awaiting-delete","extend-requested")
+$orderedBuckets = @("pending-review","reviewed-no-disposition","awaiting-delete","extend-active","exempted","other")
 $dispositionGrandTotal = 0
 foreach ($bucket in $orderedBuckets) {
     $cnt = $dispositionTotals[$bucket]
@@ -1159,7 +1175,7 @@ $totalFound = 0
 $totalTagged = 0
 $totalCost = 0.0
 
-$categoryOrder = @("UnattachedDisks","OrphanNICs","OrphanPIPs","OrphanNSGs","DeallocatedVMs","EmptyASPs","StaleSnapshots","ReviewExpired")
+$categoryOrder = @("UnattachedDisks","OrphanNICs","OrphanPIPs","OrphanNSGs","DeallocatedVMs","EmptyASPs","StaleSnapshots","ExpiredDelete","ExpiredExtend","ExpiredExempted")
 foreach ($category in $categoryOrder) {
     $found = $summary[$category].Found
     $tagged = $summary[$category].Tagged
@@ -1182,7 +1198,6 @@ Write-Log "    | TOTAL                      | $totalFoundStr   | $totalTaggedStr
 Write-Log "    +----------------------------+---------+---------+----------------+"
 Write-Log ""
 
-# Owner resolution breakdown
 $unresolvedCount = ($exportRecords | Where-Object { $_.owner -eq "unresolved" }).Count
 $resolvedCount   = $exportRecords.Count - $unresolvedCount
 $resolutionPct   = if ($exportRecords.Count -gt 0) { [math]::Round(100.0 * $resolvedCount / $exportRecords.Count, 1) } else { 0.0 }
@@ -1192,7 +1207,7 @@ Write-Log "    Unresolved:               $unresolvedCount"
 Write-Log "    Resolution rate:          $resolutionPct%"
 Write-Log ""
 
-Write-Log "POTENTIAL SAVINGS (indicative, West Europe list prices; reconcile against Cost Management):"
+Write-Log "POTENTIAL SAVINGS (indicative, West Europe list prices):"
 Write-Log "    Estimated Monthly:        EUR $([math]::Round($totalCost, 2).ToString("N2"))"
 Write-Log "    Estimated Annual:         EUR $([math]::Round($totalCost * 12, 2).ToString("N2"))"
 Write-Log ""
@@ -1203,7 +1218,6 @@ Write-Log "    End Time:                 $($scriptEndTime.ToString('yyyy-MM-dd H
 Write-Log "    Duration:                 $([math]::Round($totalDuration, 2)) seconds"
 Write-Log "    Subscriptions:            $($subsInScope.Count) scanned"
 Write-Log "    Scope:                    $Scope"
-Write-Log "    TagMode:                  $TagMode"
 Write-Log "    Script Version:           $SCRIPT_VERSION"
 Write-Log ""
 
@@ -1216,16 +1230,17 @@ if (-not $ExportPath) {
     $ExportPath = Join-Path -Path $exportDir -ChildPath "decommission-candidates-$($scriptStartTime.ToString('yyyyMMddHHmmss')).json"
 }
 $exportEnvelope = [pscustomobject]@{
-    schemaVersion         = "1.2"
+    schemaVersion         = "1.3"
     scriptVersion         = $SCRIPT_VERSION
     runStartedAt          = $scriptStartTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
     runEndedAt            = $scriptEndTime.ToString("yyyy-MM-ddTHH:mm:ssZ")
     dryRun                = $DryRun
     scope                 = $Scope
-    tagMode               = $TagMode
     idleWindowDays        = $IdleWindowDays
     staleWindowDays       = $StaleWindowDays
-    exemptReviewMaxAge    = $ExemptReviewMaxAgeDays
+    deleteApprovalMaxAge  = $DeleteApprovalMaxAgeDays
+    extensionMaxDays      = $ExtensionMaxDays
+    exemptedMaxAge        = $ExemptedMaxAgeDays
     subscriptionsScanned  = $subsInScope.Count
     totals                = [pscustomobject]@{
         found              = $totalFound
@@ -1236,10 +1251,16 @@ $exportEnvelope = [pscustomobject]@{
     dispositionBreakdown  = [pscustomobject]@{
         pendingReview         = $dispositionTotals["pending-review"]
         reviewedNoDisposition = $dispositionTotals["reviewed-no-disposition"]
-        keep                  = $dispositionTotals["keep"]
         awaitingDelete        = $dispositionTotals["awaiting-delete"]
-        extendRequested       = $dispositionTotals["extend-requested"]
+        extendActive          = $dispositionTotals["extend-active"]
+        exempted              = $dispositionTotals["exempted"]
+        other                 = $dispositionTotals["other"]
         total                 = $dispositionGrandTotal
+    }
+    expiryActivity        = [pscustomobject]@{
+        expiredDeleteReset   = $summary["ExpiredDelete"].Tagged
+        expiredExtendReset   = $summary["ExpiredExtend"].Tagged
+        expiredExemptedReset = $summary["ExpiredExempted"].Tagged
     }
     perCategory           = ($summary.GetEnumerator() | ForEach-Object {
         [pscustomobject]@{
@@ -1256,7 +1277,6 @@ try {
     $exportEnvelope | ConvertTo-Json -Depth 10 | Out-File -FilePath $ExportPath -Encoding UTF8
     Write-Log "EXPORT:"
     Write-Log "    Wrote $($exportRecords.Count) records to: $ExportPath"
-    Write-Log "    Consumed by: decommission workflow (notification, disposition, verification)"
     Write-Log ""
 }
 catch {
