@@ -14,6 +14,7 @@
 
     SCRIPT WRITES (on first detection; owner/reason refreshed on subsequent scans):
         decommission-reviewed      = "false"
+        decommission-disposition   = "delete"
         decommission-owner         = "<resolved email or 'unresolved'>"
         decommission-reason        = "orphaned" | "idle" | "stale"
         decommission-date-detected = YYYY-MM-DD
@@ -21,7 +22,7 @@
     OWNER WRITES (per-cycle decision OR standing policy):
         decommission-reviewed        = "true"
         decommission-date-reviewed   = YYYY-MM-DD
-        decommission-disposition     = "delete" | "extend" | "exempted"
+        decommission-disposition     = "delete" | "extend" | "exempted"  (overwrites script default)
         decommission-date-extended   = YYYY-MM-DD       (required when disposition = "extend")
         decommission-exempted-reason = "dr" | "compliance" | "planned-use" | "external-dep" | "legacy"
                                                           (required when disposition = "exempted")
@@ -31,33 +32,33 @@
     =====================================
     There is no decommission-state tag. The position in the workflow is computed from
     the combination of other tags:
-        pending-review           = date-detected set, reviewed = "false" (or absent)
-        reviewed-no-disposition  = reviewed = "true", disposition unset
-        awaiting-delete          = disposition = "delete", date-reviewed not expired
-        extend-active            = disposition = "extend", date-extended in future
-        exempted                 = disposition = "exempted", date-declared within 180d
+        awaiting-delete (unreviewed) = disposition = "delete", reviewed = "false" (script default)
+        awaiting-delete (confirmed)  = disposition = "delete", reviewed = "true", date-reviewed + 90d > today
+        extend-active                = disposition = "extend", date-extended in future
+        exempted                     = disposition = "exempted", date-declared within 180d
 
     EXPIRY POLICIES
     ===============
     Three disposition values, three expiry rules, enforced by the script:
-        delete   -> 90 days from date-reviewed; if not executed, reset and re-ask
+        delete   -> 90 days from date-reviewed (only after owner confirms; unreviewed defaults never expire)
         extend   -> at date-extended (capped at +90d from date-reviewed at write time)
         exempted -> 180 days from date-declared
 
-    On expiry, all three behave identically: disposition and companion tags are cleared,
-    decommission-reviewed is reset to "false", date-detected is refreshed, and the
-    resource re-enters pending-review.
+    On expiry, all three behave identically: companion tags are cleared,
+    decommission-reviewed is reset to "false", disposition is restored to "delete",
+    date-detected is refreshed, and the resource re-enters awaiting-delete (unreviewed).
 
     EXCLUSION SEMANTICS (re-scan)
     =============================
     A resource is skipped by re-scan if ANY of:
         - decommission-exclude = "true" (legacy escape hatch)
-        - disposition = "delete"   AND date-reviewed + 90d  > today
+        - decommission-date-detected is set (already in pipeline)
+        - disposition = "delete"   AND date-reviewed + 90d  > today (owner confirmed)
         - disposition = "extend"   AND date-extended        > today
         - disposition = "exempted" AND date-declared + 180d > today
 
-    A resource is re-included (and its disposition cleared) if any expiry passes,
-    OR if the owner sets disposition = "extend" with a new date-extended in the future.
+    A resource is re-included (and its disposition reset to "delete") if any expiry
+    passes, OR if the owner sets disposition = "extend" with a new date-extended.
 
     IMPORTANT: this runbook does NOT delete resources. disposition = "delete" is
     recorded but never acted on; the execution layer is deferred.
@@ -123,7 +124,8 @@
         NEW:     decommission-date-extended    (owner writes when disposition=extend)
         NEW:     decommission-date-declared    (owner writes when disposition=exempted)
         NEW:     decommission-exempted-reason  (replaces lifecycle-exempt-reason)
-        CHANGED: decommission-disposition values are now "delete" | "extend" | "exempted"
+        CHANGED: decommission-disposition defaults to "delete" (script-set);
+                 owner can overwrite with "extend" | "exempted"
                  (removed "keep"; "exempted" absorbs the old lifecycle-state=exempt semantic)
 
       FUNCTIONAL:
@@ -133,8 +135,8 @@
              - exempted: date-declared + 180d
         NEW: on any expiry, disposition+companion tags are cleared, reviewed reset to "false",
              date-detected refreshed. Resource re-enters pending-review.
-        NEW: disposition breakdown KPI now reports five buckets:
-             pending-review / reviewed-no-disposition / awaiting-delete / extend-active / exempted
+        NEW: disposition breakdown KPI now reports four buckets:
+             awaiting-delete / extend-active / exempted / other
         NEW: workflow-state derivation is computed; no state tag is written.
 
       DROPPED:
@@ -382,8 +384,9 @@ function Resolve-DecommissionOwner {
 # --- Tag application --------------------------------------------------------
 
 function Add-DecommissionTags {
-    # Writes the four script-owned tags on a newly detected resource.
-    # Owner-owned tags (reviewed=true, disposition, date-reviewed, date-extended,
+    # Writes the five script-owned tags on a newly detected resource.
+    # disposition defaults to "delete" — the owner can overwrite it with "extend"
+    # or "exempted". Owner-owned tags (reviewed=true, date-reviewed, date-extended,
     # date-declared, exempted-reason) are NEVER written by the script.
     param(
         [string]$ResourceId,
@@ -395,6 +398,7 @@ function Add-DecommissionTags {
     $today = Get-Date -Format "yyyy-MM-dd"
     $tags = @{
         "decommission-reviewed"      = "false"
+        "decommission-disposition"   = "delete"
         "decommission-owner"         = if ($Owner) { $Owner } else { "unresolved" }
         "decommission-reason"        = $Reason
         "decommission-date-detected" = $today
@@ -430,8 +434,8 @@ function Add-DecommissionTags {
 
 function Reset-ExpiredDisposition {
     # Used by the expiry scans. Clears all owner-owned disposition tags, resets
-    # reviewed to "false", and refreshes date-detected. The resource re-enters
-    # pending-review on the next scan.
+    # reviewed to "false", restores disposition to "delete" (script default), and
+    # refreshes date-detected. The resource re-enters awaiting-delete (unreviewed).
     param(
         [string]$ResourceId,
         [string]$ExpiryReason,
@@ -464,6 +468,7 @@ function Reset-ExpiredDisposition {
 
         # Reset script-owned state to "fresh candidate"
         $existingTags["decommission-reviewed"]      = "false"
+        $existingTags["decommission-disposition"]   = "delete"
         $existingTags["decommission-date-detected"] = $today
 
         Set-AzResource -ResourceId $ResourceId -Tag $existingTags -Force -ErrorAction Stop | Out-Null
@@ -570,8 +575,8 @@ if ($ExcludeResourceGroups.Count -gt 0) {
     Write-Log "  Excluded Resource Groups: (none)"
 }
 Write-Log "  Excluded by Tag:          Resources with '$ExcludeTagName = true'"
-Write-Log "  Excluded by disposition:  delete (within 90d), extend (before date-extended), exempted (within 180d)"
-Write-Log "  Re-included:              Any disposition whose expiry has passed"
+Write-Log "  Excluded by disposition:  delete (owner confirmed within 90d), extend (before date-extended), exempted (within 180d)"
+Write-Log "  Re-included:              Any disposition whose expiry has passed (reset to delete default)"
 Write-Log ""
 
 # --- KQL filter fragments (v1.3.0 nine-tag spec) ---------------------------
@@ -1027,11 +1032,12 @@ $alreadyPendingFilter
 
 # 1. Expired delete approvals (disposition = delete, date-reviewed older than 90d)
 Write-Log "[EXPIRY SCAN - delete approvals]"
-Write-Log "    Criteria: disposition = 'delete' AND date-reviewed older than $DeleteApprovalMaxAgeDays days"
+Write-Log "    Criteria: disposition = 'delete' AND reviewed = 'true' AND date-reviewed older than $DeleteApprovalMaxAgeDays days"
 $scanStart = Get-Date
 $query = @"
 resources
 | where tostring(tags['decommission-disposition']) == 'delete'
+| where tostring(tags['decommission-reviewed']) == 'true'
 | extend reviewedAt = todatetime(tostring(tags['decommission-date-reviewed']))
 | where isnull(reviewedAt) or reviewedAt < datetime('$deleteExpiryDate')
 $excludeRgFilter
@@ -1109,8 +1115,6 @@ $excludeRgFilter
 | extend reviewed    = tostring(tags['decommission-reviewed'])
 | extend disposition = tostring(tags['decommission-disposition'])
 | extend bucket = case(
-    reviewed != 'true' and isempty(disposition), 'pending-review',
-    reviewed == 'true' and isempty(disposition), 'reviewed-no-disposition',
     disposition == 'delete',   'awaiting-delete',
     disposition == 'extend',   'extend-active',
     disposition == 'exempted', 'exempted',
@@ -1122,8 +1126,6 @@ $dispositionBreakdown = Get-ResourceGraphResults -Query $dispositionQuery -Manag
 $scanDuration = ((Get-Date) - $scanStart).TotalSeconds
 
 $dispositionTotals = @{
-    "pending-review"          = 0
-    "reviewed-no-disposition" = 0
     "awaiting-delete"         = 0
     "extend-active"           = 0
     "exempted"                = 0
@@ -1141,7 +1143,7 @@ Write-Log "    Scan took $([math]::Round($scanDuration, 2))s"
 Write-Log "    +------------------------------+---------+"
 Write-Log "    | Workflow state               |  Count  |"
 Write-Log "    +------------------------------+---------+"
-$orderedBuckets = @("pending-review","reviewed-no-disposition","awaiting-delete","extend-active","exempted","other")
+$orderedBuckets = @("awaiting-delete","extend-active","exempted","other")
 $dispositionGrandTotal = 0
 foreach ($bucket in $orderedBuckets) {
     $cnt = $dispositionTotals[$bucket]
@@ -1249,8 +1251,6 @@ $exportEnvelope = [pscustomobject]@{
         ownerResolvedPct   = $resolutionPct
     }
     dispositionBreakdown  = [pscustomobject]@{
-        pendingReview         = $dispositionTotals["pending-review"]
-        reviewedNoDisposition = $dispositionTotals["reviewed-no-disposition"]
         awaitingDelete        = $dispositionTotals["awaiting-delete"]
         extendActive          = $dispositionTotals["extend-active"]
         exempted              = $dispositionTotals["exempted"]
